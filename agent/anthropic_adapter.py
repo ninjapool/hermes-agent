@@ -2661,17 +2661,146 @@ def _manage_thinking_signatures(
         m.pop("_thinking_signature_invalidated", None)
 
 
-def _evict_old_screenshots(result: List[Dict[str, Any]]) -> None:
-    """Keep only the most recent ``_MAX_KEEP_IMAGES`` computer-use screenshots.
+_DEFAULT_IMAGE_EVICTION = {
+    "mode": "count",
+    "evict_at_images": 32,
+    "evict_at_image_tokens": 48000,
+    "keep_images": 8,
+    "tokens_per_image": 1500,
+}
 
-    Base64 images cost ~1,465 tokens each and accumulate across tool calls.
-    Walk backward, keep the most recent N, replace older ones with a placeholder.
+
+def _image_eviction_settings() -> Dict[str, Any]:
+    """Resolve ``compression.image_eviction`` with defensive clamping.
+
+    Read lazily (not at import) so a profile's config.yaml is in effect, and
+    via the read-only fast path because this runs in the payload builder on
+    every API call.
+    """
+    cfg = dict(_DEFAULT_IMAGE_EVICTION)
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        user = (load_config_readonly().get("compression") or {}).get("image_eviction")
+        if isinstance(user, dict):
+            cfg.update({k: v for k, v in user.items() if k in cfg and v is not None})
+    except Exception:  # pragma: no cover - config unavailable, use defaults
+        pass
+
+    cfg["mode"] = "tokens" if str(cfg.get("mode", "")).lower() == "tokens" else "count"
+    for key in ("evict_at_images", "evict_at_image_tokens", "keep_images", "tokens_per_image"):
+        try:
+            cfg[key] = int(cfg[key])
+        except (TypeError, ValueError):
+            cfg[key] = _DEFAULT_IMAGE_EVICTION[key]
+    cfg["keep_images"] = max(0, cfg["keep_images"])
+    cfg["tokens_per_image"] = max(1, cfg["tokens_per_image"])
+    return cfg
+
+
+def _eviction_threshold_images(cfg: Dict[str, Any]) -> int:
+    """Threshold expressed in images, whichever metric is configured.
+
+    Hysteresis invariant: the threshold must sit strictly above ``keep_images``
+    or eviction would re-fire on every added image (the cache-thrash shape this
+    function exists to prevent), so it is floored at ``keep_images + 1``.
+    """
+    keep = cfg["keep_images"]
+    if cfg["mode"] == "tokens":
+        raw = -(-cfg["evict_at_image_tokens"] // cfg["tokens_per_image"])  # ceil div
+    else:
+        raw = cfg["evict_at_images"]
+    return max(keep + 1, raw)
+
+
+def _evicted_prefix_count(total_images: int, threshold: int, keep: int) -> int:
+    """How many of the oldest images are evicted, as a pure function of count.
+
+    This is the whole cache-stability contract. A rolling "keep newest N"
+    window moves its boundary on EVERY added image, so each call rewrites a
+    tool_result that sits before the cache breakpoint — the cached prefix is
+    invalidated and re-written every single call (cache_write ~= cache_read,
+    w_over_r ~= 1.0 for the whole session; ~90% of the bill on an
+    image-heavy run).
+
+    Instead the boundary advances in discrete batches of ``threshold - keep``.
+    With evict_at=8 / keep=3 (batch 5) the boundary moves only at 8, 13, 18,
+    ... images; in between, the evicted prefix is byte-identical from call to
+    call, so the cached prefix survives. Once evicted an image stays evicted
+    (monotone), which is what keeps the prefix stable rather than merely
+    smaller.
+    """
+    if keep <= 0 and threshold <= 0:
+        return total_images
+    if total_images < threshold:
+        return 0
+    batch = max(1, threshold - keep)
+    generation = (total_images - threshold) // batch + 1
+    return min(total_images, generation * batch)
+
+
+def _stripped_image_placeholder(tool_name: str, file_hint: str) -> str:
+    """Text that replaces a stripped image block.
+
+    The wording is load-bearing. The previous placeholder read
+    "[screenshot removed to save context]", which models routinely parsed as a
+    FAILED tool call and retried — one incident re-ran vision_analyze ~50x over
+    5 files. So: lead with the tool name and an explicit OK, name the file, say
+    the harness (not the tool) dropped the pixels, say plainly that it is not an
+    error, and point at the earlier analysis so a re-call is pointless.
+    """
+    name = tool_name or "image tool"
+    where = f" for {file_hint}" if file_hint else ""
+    return (
+        f"{name}: OK{where} — image analyzed successfully. "
+        "The harness dropped the pixel data from this older result to save context. "
+        "This is NOT an error and NOT a failed call: the image was received and "
+        "analyzed, and re-calling would return the identical image. "
+        "Use the analysis already in this conversation instead of calling again."
+    )
+
+
+def _tool_use_index(result: List[Dict[str, Any]]) -> Dict[str, Dict[str, str]]:
+    """Map tool_use_id -> {name, file} so a placeholder can name its source."""
+    index: Dict[str, Dict[str, str]] = {}
+    for msg in result:
+        content = msg.get("content")
+        if msg.get("role") != "assistant" or not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            tool_id = block.get("id")
+            if not isinstance(tool_id, str):
+                continue
+            raw_args = block.get("input")
+            args: Dict[str, Any] = raw_args if isinstance(raw_args, dict) else {}
+            file_hint = ""
+            for key in ("image_url", "path", "file_path", "image", "url", "filename"):
+                val = args.get(key)
+                if isinstance(val, str) and val.strip():
+                    file_hint = val.strip().rsplit("/", 1)[-1][:120]
+                    break
+            index[tool_id] = {"name": str(block.get("name") or ""), "file": file_hint}
+    return index
+
+
+def _evict_old_screenshots(result: List[Dict[str, Any]]) -> None:
+    """Batch-evict old images once a threshold is crossed (cache-stable).
+
+    Threshold and keep-window come from ``compression.image_eviction``.
+    See ``_evicted_prefix_count`` for why this is a step function and not a
+    rolling window.
 
     Mutates ``result`` in place.
     """
-    _MAX_KEEP_IMAGES = 3
-    _image_count = 0
-    for msg in reversed(result):
+    cfg = _image_eviction_settings()
+    keep = cfg["keep_images"]
+    threshold = _eviction_threshold_images(cfg)
+
+    # Oldest -> newest, so index 0 is the oldest image-bearing tool_result.
+    bearers: List[Dict[str, Any]] = []
+    for msg in result:
         content = msg.get("content")
         if not isinstance(content, list):
             continue
@@ -2681,19 +2810,24 @@ def _evict_old_screenshots(result: List[Dict[str, Any]]) -> None:
             inner = block.get("content")
             if not isinstance(inner, list):
                 continue
-            has_image = any(
-                isinstance(b, dict) and b.get("type") == "image"
-                for b in inner
-            )
-            if not has_image:
-                continue
-            _image_count += 1
-            if _image_count > _MAX_KEEP_IMAGES:
-                block["content"] = [
-                    b if b.get("type") != "image"
-                    else {"type": "text", "text": "[screenshot removed to save context]"}
-                    for b in inner
-                ]
+            if any(isinstance(b, dict) and b.get("type") == "image" for b in inner):
+                bearers.append(block)
+
+    evict_upto = _evicted_prefix_count(len(bearers), threshold, keep)
+    if evict_upto <= 0:
+        return
+
+    tool_index = _tool_use_index(result)
+    for block in bearers[:evict_upto]:
+        meta = tool_index.get(block.get("tool_use_id") or "", {})
+        placeholder = _stripped_image_placeholder(
+            meta.get("name", ""), meta.get("file", "")
+        )
+        block["content"] = [
+            b if not (isinstance(b, dict) and b.get("type") == "image")
+            else {"type": "text", "text": placeholder}
+            for b in block["content"]
+        ]
 
 
 def _ensure_leading_user_turn(result: List[Dict[str, Any]]) -> None:
