@@ -6,6 +6,33 @@ consciously dropped if upstream has landed an equivalent.
 
 Check this file before and after every pin bump.
 
+## TODO — unfinished, carried across sessions
+
+**Push the upstream port of the image-eviction fix and open the PR.**
+Ported and committed but NOT pushed as of 2026-09-02.
+
+- **Local branch:** `fix/cache-stable-image-eviction-upstream`, commit `69a34575c`
+- **Blocked on:** the `gh` token lacks the `workflow` scope. The branch carries
+  upstream commits that touch `.github/workflows/case-collision-check.yml`
+  (our own commit touches no workflow file), so both `git push` and
+  `gh repo sync` are rejected. Fix with `gh auth refresh -s workflow`, or sync
+  the fork's `main` from the GitHub web UI, then:
+
+  ```bash
+  git push fork fix/cache-stable-image-eviction-upstream
+  gh pr create --repo NousResearch/hermes-agent --base main \
+    --head ninjapool:fix/cache-stable-image-eviction-upstream
+  ```
+
+- **Then:** add the PR link to the eviction entry below (it currently cites
+  only fork PR #1).
+- **Note for whoever picks this up:** upstream `main` has moved past
+  `pinned-0.20.6` and the function now lives in
+  `agent/anthropic_message_convert.py`, not `agent/anthropic_adapter.py`, which
+  re-exports it. The port already accounts for this — the tests patch the
+  **defining** module, because patching the adapter's re-export silently does
+  not affect the caller. Do not "simplify" those patch targets back.
+
 ## How to carry these forward
 
 ```bash
