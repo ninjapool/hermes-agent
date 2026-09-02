@@ -2663,9 +2663,9 @@ def _manage_thinking_signatures(
 
 _DEFAULT_IMAGE_EVICTION = {
     "mode": "count",
-    "evict_at_images": 8,
-    "evict_at_image_tokens": 12000,
-    "keep_images": 3,
+    "evict_at_images": 32,
+    "evict_at_image_tokens": 48000,
+    "keep_images": 8,
     "tokens_per_image": 1500,
 }
 

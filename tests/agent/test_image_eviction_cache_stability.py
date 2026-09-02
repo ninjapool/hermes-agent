@@ -23,6 +23,7 @@ import pytest
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 from agent.anthropic_adapter import (  # noqa: E402
+    _DEFAULT_IMAGE_EVICTION,
     _evicted_prefix_count,
     _stripped_image_placeholder,
     convert_messages_to_anthropic,
@@ -88,14 +89,28 @@ def _synthetic_session(n_calls: int, n_images: int) -> list:
     image_calls = {int(round(i * (n_calls - 1) / max(1, n_images - 1))) for i in range(n_images)}
     placed = 0
     for turn in range(n_calls):
-        if turn in image_calls and placed < n_images:
-            messages += _image_tool_result(
-                f"call_{placed}", "vision_analyze", f"/photos/site_{placed:02d}.jpg"
-            )
-            placed += 1
+        # A dense session analyses several photos per turn, so place as many
+        # images as this turn is owed rather than capping at one — otherwise
+        # n_images silently clamps to n_calls.
+        owed = 0
+        if turn in image_calls:
+            owed = max(1, round((turn + 1) * n_images / n_calls) - placed)
+        owed = min(owed, n_images - placed)
+        if owed > 0:
+            for _ in range(owed):
+                messages += _image_tool_result(
+                    f"call_{placed}", "vision_analyze", f"/photos/site_{placed:02d}.jpg"
+                )
+                placed += 1
         else:
             messages.append({"role": "assistant", "content": f"Noted observation {turn}."})
             messages.append({"role": "user", "content": f"Continue with step {turn}."})
+    # Any shortfall would silently weaken the test, so top up explicitly.
+    while placed < n_images:
+        messages += _image_tool_result(
+            f"call_{placed}", "vision_analyze", f"/photos/site_{placed:02d}.jpg"
+        )
+        placed += 1
     assert placed == n_images, f"placed {placed} images, wanted {n_images}"
     return messages
 
@@ -209,26 +224,27 @@ def _simulate_cache(prefixes: list) -> list:
 
 @pytest.fixture()
 def default_eviction(monkeypatch):
-    """Pin thresholds so the test does not depend on the developer's config."""
+    """Run the cache tests against the SHIPPED defaults.
+
+    Deliberately not a hardcoded copy: the whole point of these tests is that
+    whatever we ship keeps w/r low, so they must fail if someone retunes the
+    defaults into a thrashing configuration. Config lookup is still stubbed so
+    the developer's own config.yaml cannot influence the result.
+    """
     monkeypatch.setattr(
         "agent.anthropic_adapter._image_eviction_settings",
-        lambda: {
-            "mode": "count",
-            "evict_at_images": 8,
-            "evict_at_image_tokens": 12000,
-            "keep_images": 3,
-            "tokens_per_image": 1500,
-        },
+        lambda: dict(_DEFAULT_IMAGE_EVICTION),
     )
+    return dict(_DEFAULT_IMAGE_EVICTION)
 
 
 def test_w_over_r_stays_low_across_a_20_image_session(default_eviction):
     """w/r < 0.2 on every call after the first 3, except at eviction events.
 
-    Eviction events are the deliberate, rare exception: a batch evict rewrites
-    the evicted span once, which costs one cache write. The contract is that
-    they are RARE (3 in a 25-call session here) rather than every-call, which
-    is what the old rolling window did.
+    20 images sits BELOW the shipped 32-image threshold, so this session should
+    never evict at all — the prefix is pure-append and w/r is dominated by
+    cache reads. That is the intended behaviour for an ordinary session; the
+    dense case that actually crosses the threshold is covered below.
     """
     messages = _synthetic_session(n_calls=25, n_images=20)
 
@@ -255,8 +271,47 @@ def test_w_over_r_stays_low_across_a_20_image_session(default_eviction):
             offenders.append((i, round(ratio, 3)))
 
     assert not offenders, f"steady-state calls exceeding w/r 0.2: {offenders}"
-    # Eviction must be episodic, not per-call.
-    assert len(eviction_calls) <= 4, f"too many eviction events: {sorted(eviction_calls)}"
+    # Below the threshold there is nothing to evict.
+    assert not eviction_calls, f"unexpected eviction below threshold: {eviction_calls}"
+
+
+def test_w_over_r_stays_low_on_a_dense_image_session(default_eviction):
+    """The incident's shape: enough images to cross the threshold repeatedly.
+
+    80 images against a 32/8 default means several real eviction events. The
+    contract is unchanged — steady-state calls stay under w/r 0.2 and the
+    rewrites stay episodic rather than per-call.
+    """
+    messages = _synthetic_session(n_calls=40, n_images=80)
+
+    prefixes = []
+    rest = messages[2:]
+    step = max(1, len(rest) // 40)
+    for i in range(40):
+        convo = messages[: 2 + min(len(rest), (i + 1) * step)]
+        prefixes.append(_build_call(convo)[1])
+
+    stats = _simulate_cache(prefixes)
+
+    eviction_calls = {
+        i
+        for i in range(1, len(prefixes))
+        if _common_prefix_len(prefixes[i - 1], prefixes[i]) < len(prefixes[i - 1])
+    }
+
+    offenders = [
+        (i, round(s["cache_write"] / s["cache_read"], 3))
+        for i, s in enumerate(stats)
+        if i >= 3
+        and i not in eviction_calls
+        and s["cache_read"]
+        and s["cache_write"] / s["cache_read"] >= 0.2
+    ]
+    assert not offenders, f"steady-state calls exceeding w/r 0.2: {offenders}"
+
+    # 80 images, batch of 24 => a handful of crossings, nowhere near per-call.
+    assert eviction_calls, "dense session should cross the threshold at least once"
+    assert len(eviction_calls) <= 6, f"eviction not episodic: {sorted(eviction_calls)}"
 
 
 def _rolling_window_evict(result: list) -> None:
@@ -290,13 +345,13 @@ def test_new_eviction_beats_the_old_rolling_window(default_eviction, monkeypatch
     the same real payload builder, so it fails if anyone reintroduces a
     per-call rolling window.
     """
-    messages = _synthetic_session(n_calls=25, n_images=20)
+    messages = _synthetic_session(n_calls=40, n_images=80)
     rest = messages[2:]
-    step = max(1, len(rest) // 25)
+    step = max(1, len(rest) // 40)
 
     def run() -> tuple:
         prefixes = []
-        for i in range(25):
+        for i in range(40):
             convo = messages[: 2 + min(len(rest), (i + 1) * step)]
             prefixes.append(_build_call(convo)[1])
         stats = _simulate_cache(prefixes)
@@ -316,8 +371,8 @@ def test_new_eviction_beats_the_old_rolling_window(default_eviction, monkeypatch
     )
     old_ratio, old_rewrites = run()
 
-    assert old_rewrites > 15, f"baseline should thrash; got {old_rewrites} rewrites"
-    assert new_rewrites <= 4, f"fix should be episodic; got {new_rewrites} rewrites"
+    assert old_rewrites > 25, f"baseline should thrash; got {old_rewrites} rewrites"
+    assert new_rewrites <= 6, f"fix should be episodic; got {new_rewrites} rewrites"
     assert new_ratio < old_ratio / 2, (
         f"session w/r not materially improved: new={new_ratio:.3f} old={old_ratio:.3f}"
     )
@@ -325,13 +380,13 @@ def test_new_eviction_beats_the_old_rolling_window(default_eviction, monkeypatch
 
 def test_prefix_is_byte_identical_except_at_eviction_events(default_eviction):
     """Between crossings the pre-breakpoint prefix must not change at all."""
-    messages = _synthetic_session(n_calls=25, n_images=20)
+    messages = _synthetic_session(n_calls=40, n_images=80)
     rest = messages[2:]
-    step = max(1, len(rest) // 25)
+    step = max(1, len(rest) // 40)
 
     prefixes = []
     image_counts = []
-    for i in range(25):
+    for i in range(40):
         convo = messages[: 2 + min(len(rest), (i + 1) * step)]
         planned, prefix = _build_call(convo)
         prefixes.append(prefix)
@@ -347,33 +402,40 @@ def test_prefix_is_byte_identical_except_at_eviction_events(default_eviction):
         if _common_prefix_len(prev, cur) < len(prev):
             non_append.append(i)
 
-    # Eviction events are the only legal non-append rewrites, and they are
-    # rare: batch size 5 over 20 images => at most a handful.
-    assert len(non_append) <= 4, (
+    # Eviction events are the only legal non-append rewrites, and with a batch
+    # of 24 over 80 images there are only a few.
+    assert len(non_append) <= 6, (
         f"too many pre-breakpoint rewrites (cache thrash): {non_append}"
     )
 
 
 def test_eviction_is_a_step_function_not_a_rolling_window():
-    """The boundary must hold steady between crossings (evict 8, keep 3)."""
-    counts = [_evicted_prefix_count(n, threshold=8, keep=3) for n in range(0, 20)]
+    """The boundary must hold steady between crossings (shipped 32/8)."""
+    threshold = _DEFAULT_IMAGE_EVICTION["evict_at_images"]  # 32
+    keep = _DEFAULT_IMAGE_EVICTION["keep_images"]           # 8
+    batch = threshold - keep                                # 24
+    counts = [_evicted_prefix_count(n, threshold=threshold, keep=keep)
+              for n in range(0, threshold * 2 + 2)]
+
     # Nothing evicted below the threshold.
-    assert counts[:8] == [0] * 8
-    # First crossing evicts one batch, then holds for the next 4 images.
-    assert counts[8:13] == [5, 5, 5, 5, 5]
-    # Second crossing evicts the next batch, then holds again.
-    assert counts[13:18] == [10, 10, 10, 10, 10]
+    assert counts[:threshold] == [0] * threshold
+    # First crossing evicts one batch, then holds until the next crossing.
+    assert counts[threshold: threshold + batch] == [batch] * batch
+    # Second crossing evicts the next batch.
+    assert counts[threshold + batch] == batch * 2
     # Monotone: an evicted image is never resurrected.
     assert counts == sorted(counts)
 
 
 def test_kept_window_never_shrinks_below_keep_n():
     """Live (un-evicted) images always stay within [keep, threshold)."""
-    for n in range(0, 40):
-        live = n - _evicted_prefix_count(n, threshold=8, keep=3)
-        assert live < 8, f"{n} images: {live} live exceeds threshold"
-        if n >= 8:
-            assert live >= 3, f"{n} images: only {live} live, below keep_images"
+    threshold = _DEFAULT_IMAGE_EVICTION["evict_at_images"]
+    keep = _DEFAULT_IMAGE_EVICTION["keep_images"]
+    for n in range(0, threshold * 3):
+        live = n - _evicted_prefix_count(n, threshold=threshold, keep=keep)
+        assert live < threshold, f"{n} images: {live} live exceeds threshold"
+        if n >= threshold:
+            assert live >= keep, f"{n} images: only {live} live, below keep_images"
 
 
 def test_placeholder_reads_as_success_not_failure():
@@ -392,8 +454,12 @@ def test_placeholder_reads_as_success_not_failure():
 
 
 def test_old_placeholder_string_is_not_reachable(default_eviction):
-    """End-to-end: the retired wording must not appear in a built payload."""
-    messages = _synthetic_session(n_calls=25, n_images=20)
+    """End-to-end: the retired wording must not appear in a built payload.
+
+    Uses a dense session so eviction actually fires — a below-threshold
+    session would pass this vacuously, with no placeholder emitted at all.
+    """
+    messages = _synthetic_session(n_calls=40, n_images=80)
     planned, _ = _build_call(messages)
     blob = json.dumps(planned)
     assert "screenshot removed to save context" not in blob
