@@ -359,13 +359,20 @@ def context_pct(agent: Any) -> Optional[float]:
     return min(100.0, (used / window) * 100.0)
 
 
-def _money(amount: float) -> str:
+def _money(amount: Optional[float]) -> str:
     """Render a USD amount for the footer.
+
+    ``None`` means "cost could not be determined" (the model has no pricing
+    on this route) and renders as ``$?``. That distinction is load-bearing:
+    printing ``$0.00`` for an unpriced model is indistinguishable from a
+    genuinely free turn, which is how a $191 session looked free.
 
     Sub-cent amounts render at 4dp so a cheap turn never displays as a
     dishonest ``$0.00`` (the same concern ``usage_pricing.format_cost_label``
     handles for the CLI cost labels).
     """
+    if amount is None:
+        return "$?"
     try:
         value = float(amount)
     except (TypeError, ValueError):
@@ -377,15 +384,42 @@ def _money(amount: float) -> str:
     return f"${value:,.2f}"
 
 
+def cost_is_known(agent: Any) -> bool:
+    """True when this agent's model+route has usable pricing.
+
+    False means every cost number for the turn is structurally 0, so the
+    footer must say ``$?`` rather than ``$0.00``.
+    """
+    try:
+        from agent.usage_pricing import has_known_pricing
+
+        model = str(getattr(agent, "model", "") or "").strip()
+        if not model:
+            return True
+        provider = str(getattr(agent, "provider", "") or "").strip() or None
+        base_url = str(getattr(agent, "base_url", "") or "").strip() or None
+        return bool(has_known_pricing(model, provider=provider, base_url=base_url))
+    except Exception:
+        # Never let a pricing probe break the reply; assume known so we don't
+        # spam "$?" on a transient import problem.
+        return True
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Status footer
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 def format_footer_line(
-    ctx_pct: Optional[float], turn_usd: float, session_usd: float
+    ctx_pct: Optional[float],
+    turn_usd: Optional[float],
+    session_usd: Optional[float],
 ) -> str:
-    """Build the footer string. Pure — this is the unit under test."""
+    """Build the footer string. Pure — this is the unit under test.
+
+    Pass ``None`` for the cost figures when the model has no pricing; they
+    render as ``$?`` so an unpriced model is never mistaken for a free one.
+    """
     ctx_part = "ctx —" if ctx_pct is None else f"ctx {int(round(ctx_pct))}%"
     return f"{ctx_part} · turn {_money(turn_usd)} · session {_money(session_usd)}"
 
@@ -415,6 +449,19 @@ def render_footer(
         entry = _peek(sid)
         turn_usd = float(entry.get("turn_cost_usd", 0.0) or 0.0)
         session_usd = float(entry.get("session_cost_usd", 0.0) or 0.0)
+
+    # An unpriced model reports 0.0 for every turn. Showing "$0.00" there is
+    # a false statement of fact — render "$?" and say why in the log once per
+    # turn so the operator can fix the pricing table or config override.
+    if not cost_is_known(agent):
+        logger.warning(
+            "cost_visibility: no pricing for model=%r provider=%r — footer shows "
+            "$? instead of $0.00. Add the model to agent/usage_pricing.py or set "
+            "pricing.overrides in config.yaml.",
+            getattr(agent, "model", ""),
+            getattr(agent, "provider", ""),
+        )
+        return format_footer_line(context_pct(agent), None, None)
 
     return format_footer_line(context_pct(agent), turn_usd, session_usd)
 
@@ -701,7 +748,53 @@ def selfcheck_line(config: Optional[CostVisibilityConfig] = None) -> str:
     return f"cost_visibility loaded — {cfg.as_log_fields()}"
 
 
+def active_model_pricing_warning() -> str:
+    """Return a warning if the configured model has no usable pricing.
+
+    A model missing from BOTH the shipped table and ``pricing.overrides`` in
+    config.yaml costs $0.00 per call, which silently reports a runaway
+    session as free — the exact failure that hid a $191 session. Returns ""
+    when pricing resolves.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+
+        cfg_path = get_hermes_home() / "config.yaml"
+        raw: dict = {}
+        if cfg_path.exists():
+            import yaml
+
+            with open(cfg_path, "r", encoding="utf-8") as fh:
+                raw = yaml.safe_load(fh) or {}
+        model_cfg = raw.get("model") or {}
+        model = str(model_cfg.get("model") or "").strip()
+        provider = str(model_cfg.get("provider") or "").strip()
+        if not model:
+            # No pinned model: the agent resolves one at runtime, so there is
+            # nothing to check here. Staying quiet beats a false alarm.
+            return ""
+
+        from agent.usage_pricing import has_known_pricing
+
+        if has_known_pricing(model, provider=provider or None):
+            return ""
+        return (
+            f"!!! NO PRICING for active model {provider or '?'}/{model} — every "
+            "cost figure will read $0.00 and spend warnings can NEVER fire. "
+            "Add it to agent/usage_pricing.py, or set pricing.overrides."
+            f'"{provider or "anthropic"}/{model}" in config.yaml '
+            "(input/output/cache_read/cache_write/cache_write_1h, USD per million tokens)."
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        return f"pricing self-check failed: {exc}"
+
+
 def log_selfcheck(target_logger: Optional[logging.Logger] = None) -> str:
+    log = target_logger or logger
     line = selfcheck_line()
-    (target_logger or logger).info(line)
+    log.info(line)
+    warning = active_model_pricing_warning()
+    if warning:
+        log.warning(warning)
+        return line + " | " + warning
     return line

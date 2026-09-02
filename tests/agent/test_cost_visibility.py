@@ -38,12 +38,16 @@ class _FakeAgent:
         window=0,
         platform="telegram",
         messages=None,
+        model="",
+        provider="",
     ):
         self.session_id = session_id
         self.session_estimated_cost_usd = cost
         self.context_compressor = _FakeCompressor(used, window)
         self.platform = platform
         self.messages = messages or []
+        self.model = model
+        self.provider = provider
 
 
 class CostVisibilityTestBase(unittest.TestCase):
@@ -314,6 +318,193 @@ class TestSelfCheckAndConfig(CostVisibilityTestBase):
         section = DEFAULT_CONFIG[cv.CONFIG_SECTION]
         for key in ("enabled", "cost_warn_usd", "ctx_warn_pct", "handoff_max_words"):
             self.assertIn(key, section)
+
+
+class UnknownCostRendersQuestionMarkTests(CostVisibilityTestBase):
+    """A model with no pricing must never render as $0.00.
+
+    This is the bug that hid the $191 session: an unpriced model reports
+    0.0 for every turn, and "$0.00" is indistinguishable from a free turn.
+    """
+
+    def test_money_renders_none_as_question_mark(self):
+        self.assertEqual(cv._money(None), "$?")
+
+    def test_money_still_renders_a_real_zero_as_zero(self):
+        # A genuinely-free turn on a PRICED model must keep saying $0.00 —
+        # "$?" is reserved for "we could not determine this".
+        self.assertEqual(cv._money(0.0), "$0.00")
+
+    def test_footer_line_renders_question_marks_when_cost_unknown(self):
+        line = cv.format_footer_line(42.0, None, None)
+        self.assertIn("turn $?", line)
+        self.assertIn("session $?", line)
+        self.assertNotIn("$0.00", line)
+        # Context is measured independently of pricing, so it still shows.
+        self.assertIn("ctx 42%", line)
+
+    def test_render_footer_uses_question_mark_for_unpriced_model(self):
+        agent = _FakeAgent(
+            session_id="unpriced-1",
+            cost=0.0,
+            used=1000,
+            window=10000,
+            model="totally-made-up-model-xyz",
+            provider="anthropic",
+        )
+        with patch.object(cv, "cost_is_known", return_value=False):
+            footer = cv.render_footer(agent, "unpriced-1")
+        self.assertIn("$?", footer)
+        self.assertNotIn("$0.00", footer)
+
+    def test_render_footer_uses_dollars_for_priced_model(self):
+        agent = _FakeAgent(
+            session_id="priced-1",
+            cost=0.25,
+            used=1000,
+            window=10000,
+            model="claude-opus-5",
+            provider="anthropic",
+        )
+        with patch.object(cv, "cost_is_known", return_value=True):
+            footer = cv.render_footer(agent, "priced-1")
+        self.assertIn("$0.25", footer)
+        self.assertNotIn("$?", footer)
+
+    def test_cost_is_known_is_true_when_model_unset(self):
+        # No pinned model on the agent: don't cry wolf.
+        self.assertTrue(cv.cost_is_known(_FakeAgent()))
+
+
+class ActiveModelPricingWarningTests(CostVisibilityTestBase):
+    """Startup must shout when the configured model cannot be priced."""
+
+    def _write_config(self, model, provider="anthropic"):
+        import pathlib
+
+        cfg = pathlib.Path(self._tmp.name) / "config.yaml"
+        cfg.write_text(
+            f"model:\n  provider: {provider}\n  model: {model}\n", encoding="utf-8"
+        )
+        return cfg
+
+    def test_warns_for_unpriced_model(self):
+        self._write_config("totally-made-up-model-xyz")
+        msg = cv.active_model_pricing_warning()
+        self.assertIn("NO PRICING", msg)
+        self.assertIn("totally-made-up-model-xyz", msg)
+
+    def test_silent_for_priced_model(self):
+        self._write_config("claude-opus-5")
+        self.assertEqual(cv.active_model_pricing_warning(), "")
+
+    def test_silent_when_no_model_pinned(self):
+        import pathlib
+
+        pathlib.Path(self._tmp.name, "config.yaml").write_text(
+            "model:\n  provider: anthropic\n", encoding="utf-8"
+        )
+        self.assertEqual(cv.active_model_pricing_warning(), "")
+
+
+class PricingTableContractTests(unittest.TestCase):
+    """Invariants about the pricing table — not a snapshot of its contents."""
+
+    def test_current_anthropic_models_are_priced(self):
+        """Models Hermes actually routes to must resolve to a price.
+
+        Deliberately not asserting the rate: that changes. Asserting only
+        that the lookup succeeds, which is what prevents a silent $0.00.
+        """
+        from agent.usage_pricing import has_known_pricing
+
+        for model in ("claude-opus-5", "claude-fable-5", "claude-sonnet-5"):
+            with self.subTest(model=model):
+                self.assertTrue(
+                    has_known_pricing(model, provider="anthropic"),
+                    f"{model} has no pricing entry — cost will report $0.00",
+                )
+
+    def test_anthropic_1h_cache_write_is_double_base_input(self):
+        """Anthropic's published rule: 1h writes bill at 2x base input.
+
+        A relationship, not a frozen number — it stays true across price
+        changes and catches a mistyped rate.
+        """
+        from decimal import Decimal
+
+        from agent.usage_pricing import _OFFICIAL_DOCS_PRICING
+
+        checked = 0
+        for (provider, model), entry in _OFFICIAL_DOCS_PRICING.items():
+            if provider != "anthropic":
+                continue
+            if entry.cache_write_1h_cost_per_million is None:
+                continue
+            if entry.input_cost_per_million is None:
+                continue
+            checked += 1
+            self.assertEqual(
+                entry.cache_write_1h_cost_per_million,
+                entry.input_cost_per_million * Decimal("2"),
+                f"{model}: 1h cache-write rate is not 2x base input",
+            )
+        self.assertGreater(checked, 0, "no Anthropic 1h rates found to check")
+
+    def test_1h_cache_write_tokens_bill_higher_than_5m(self):
+        """The TTL split must actually reach the arithmetic."""
+        from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+
+        all_5m = CanonicalUsage(cache_write_tokens=1_000_000)
+        all_1h = CanonicalUsage(
+            cache_write_tokens=1_000_000, cache_write_1h_tokens=1_000_000
+        )
+        cost_5m = estimate_usage_cost("claude-opus-5", all_5m, provider="anthropic")
+        cost_1h = estimate_usage_cost("claude-opus-5", all_1h, provider="anthropic")
+        assert cost_5m.amount_usd is not None
+        assert cost_1h.amount_usd is not None
+        self.assertGreater(
+            cost_1h.amount_usd,
+            cost_5m.amount_usd,
+            "1h cache writes must cost more than 5m writes",
+        )
+
+    def test_config_override_prices_an_unknown_model(self):
+        """An operator can price a brand-new model without a code patch."""
+        import pathlib
+        import tempfile
+
+        from agent import usage_pricing as up
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pathlib.Path(tmp, "config.yaml").write_text(
+                "pricing:\n"
+                "  overrides:\n"
+                '    "anthropic/some-unreleased-model":\n'
+                "      input: 7.00\n"
+                "      output: 21.00\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"HERMES_HOME": tmp}):
+                up._PRICING_OVERRIDE_CACHE = None
+                up._PRICING_OVERRIDE_MTIME = -1.0
+                try:
+                    self.assertTrue(
+                        up.has_known_pricing(
+                            "some-unreleased-model", provider="anthropic"
+                        )
+                    )
+                    usage = up.CanonicalUsage(
+                        input_tokens=1_000_000, output_tokens=1_000_000
+                    )
+                    result = up.estimate_usage_cost(
+                        "some-unreleased-model", usage, provider="anthropic"
+                    )
+                    assert result.amount_usd is not None
+                    self.assertEqual(int(result.amount_usd), 28)
+                finally:
+                    up._PRICING_OVERRIDE_CACHE = None
+                    up._PRICING_OVERRIDE_MTIME = -1.0
 
 
 if __name__ == "__main__":
