@@ -892,6 +892,31 @@ DEFAULT_CONFIG = {
                                       # exceeds this many tokens, the next pass
                                       # re-summarizes the summary itself instead of
                                       # letting it grow without bound.
+
+        # Image eviction (#incident 2026-09-01): older image blocks are
+        # stripped from the outbound payload so base64 pixel data does not ride
+        # every subsequent request. Eviction is a STEP function, not a rolling
+        # window: it fires only when the image count crosses `evict_at_images`,
+        # then batch-evicts down to `keep_images` and leaves the prefix alone
+        # until the next crossing.
+        #
+        # Why the hysteresis matters: a rolling keep-newest-N window moves its
+        # boundary on every added image, rewriting a tool_result that sits
+        # BEFORE the cache breakpoint. That invalidates the cached prefix on
+        # every single call — cache_write ends up ~= cache_read for the whole
+        # session (~90% of the bill on an image-heavy run). Keep
+        # `evict_at_images` meaningfully above `keep_images`; the code floors
+        # the gap at 1 regardless.
+        "image_eviction": {
+            "mode": "count",              # "count" (image count) or "tokens"
+                                          # (estimated image tokens)
+            "evict_at_images": 8,         # count mode: evict once this many
+                                          # image-bearing tool results are in context
+            "evict_at_image_tokens": 12000,  # tokens mode: same trigger, expressed
+                                          # as estimated image tokens
+            "keep_images": 3,             # newest N images kept after a batch evict
+            "tokens_per_image": 1500,     # estimate used by tokens mode
+        },
         "hygiene_hard_message_limit": 5000,  # gateway session-hygiene force-compress threshold by message count
         "hygiene_timeout_seconds": 30,  # max seconds gateway waits for pre-agent hygiene compression
                                       # WITHOUT forward progress. The summary call streams, so
