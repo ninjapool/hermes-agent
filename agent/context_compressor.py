@@ -2168,9 +2168,31 @@ def _summarize_tool_result_unguarded(tool_name: str, tool_args: str, tool_conten
         return f"[vision_analyze] '{question}' ({content_len:,} chars)"
 
     if tool_name == "memory":
-        action = args.get("action", "?")
+        # The write's OUTCOME is the load-bearing fact, not the call shape:
+        # a summary that renders only args reads identically for a saved
+        # write and a rejected one, so reconstructed history silently
+        # asserts success. Batch calls carry no top-level "action"/"target"
+        # (they live per-op in "operations"), which is why the args-only
+        # form degraded to "[memory] ? on ?".
+        action = args.get("action") or (
+            f"{len(args['operations'])} ops"
+            if isinstance(args.get("operations"), list)
+            else "?"
+        )
         target = args.get("target", "?")
-        return f"[memory] {action} on {target}"
+        outcome = ""
+        try:
+            result = json.loads(tool_content) if tool_content else {}
+        except (ValueError, TypeError):
+            result = {}
+        if isinstance(result, dict) and "success" in result:
+            if result.get("success"):
+                usage = result.get("usage")
+                outcome = " -> success" + (f" ({usage})" if usage else "")
+            else:
+                err = str(result.get("error", "")).split("\n")[0][:120]
+                outcome = " -> FAILED" + (f": {err}" if err else "")
+        return f"[memory] {action} on {target}{outcome}"
 
     if tool_name == "todo":
         return "[todo] updated task list"
