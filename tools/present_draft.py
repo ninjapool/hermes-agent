@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_constants import display_hermes_home, get_hermes_home
+from agent.approval_tokens import KIND_DRAFT, get_registry
 from tools.registry import registry
 
 # Drafts live under HERMES_HOME so each profile keeps its own (never ~/.hermes).
@@ -296,6 +297,138 @@ def lint_outbound_reply(text: str) -> Optional[str]:
         "draft with present_draft(to, subject, body, attachments=[...]) and "
         "post its 'rendered' output verbatim."
     )
+
+
+# --- Sending (token-gated) ------------------------------------------------
+
+
+def send_draft(
+    draft_id: str,
+    approval_token: str = "",
+    session_id: str = "",
+    task_id: Optional[str] = None,
+) -> str:
+    """Send a previously-presented draft. Requires a user-minted token.
+
+    A draft id alone is NOT authority to send. The id proves *which* object
+    would go out; the token proves a human said to send it. Keeping them
+    separate is the whole point: on 2026-09-08 the agent offered to wait for
+    approval, received none across eight user turns, and acted as though the
+    wait had happened. An id it minted itself would have let that recur.
+
+    The token is spent whatever the send's outcome — one approval is one
+    send attempt, never a standing permission.
+    """
+    draft = load_draft(draft_id)
+    if draft is None:
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    f"no draft {draft_id!r}. Present it with present_draft "
+                    "first; drafts are not sendable until rendered."
+                ),
+            }
+        )
+
+    ok, reason = get_registry().consume(
+        token=approval_token,
+        kind=KIND_DRAFT,
+        subject_id=draft_id,
+        session_id=session_id or draft.get("session_id", ""),
+    )
+    if not ok:
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"not sent — {reason}",
+                "draft_id": draft_id,
+                "needs": f"/approve {draft_id}",
+                "note": (
+                    "Do not retry with a different token or re-present the "
+                    "draft to obtain one. Ask the user and stop."
+                ),
+            }
+        )
+
+    # Re-verify the attachments at send time. The draft may have been rendered
+    # minutes ago and a file moved since; the reviewer approved openable files,
+    # so sending unopenable ones would break the thing they approved.
+    missing = [
+        a["path"]
+        for a in draft.get("attachments", [])
+        if not Path(a["path"]).is_file()
+    ]
+    if missing:
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    "approval consumed but NOT sent: "
+                    f"{len(missing)} attachment(s) no longer exist: "
+                    f"{', '.join(missing)}. Re-present the draft and ask for "
+                    "approval again."
+                ),
+                "draft_id": draft_id,
+            }
+        )
+
+    return json.dumps(
+        {
+            "success": True,
+            "draft_id": draft_id,
+            "to": draft.get("to"),
+            "cc": draft.get("cc"),
+            "subject": draft.get("subject"),
+            "attachment_count": len(draft.get("attachments", [])),
+            "approved": True,
+            "note": (
+                "Approval verified and spent. Hand this draft to the configured "
+                "send transport, then verify against the Sent folder — the "
+                "transport's success line is a claim, the Sent message is the "
+                "fact."
+            ),
+        }
+    )
+
+
+registry.register(
+    name="send_email",
+    toolset="email_draft",
+    schema={
+        "name": "send_email",
+        "description": (
+            "Send a draft previously rendered by present_draft. Requires BOTH "
+            "the draft_id AND an approval_token that the user minted by "
+            "replying '/approve <draft_id>'. There is no other way to send: "
+            "your own reading of the conversation, however clear, is not an "
+            "approval. If you have no token, ask for one and stop."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "draft_id": {
+                    "type": "string",
+                    "description": "The id returned by present_draft.",
+                },
+                "approval_token": {
+                    "type": "string",
+                    "description": (
+                        "The token issued when the user replied "
+                        "'/approve <draft_id>'. Never invent or guess this."
+                    ),
+                },
+            },
+            "required": ["draft_id", "approval_token"],
+        },
+    },
+    handler=lambda args, **kw: send_draft(
+        draft_id=args.get("draft_id", ""),
+        approval_token=args.get("approval_token", ""),
+        session_id=kw.get("session_id", "") or "",
+        task_id=kw.get("task_id"),
+    ),
+)
 
 
 registry.register(

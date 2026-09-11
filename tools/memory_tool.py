@@ -1083,6 +1083,79 @@ def _apply_write_gate(action: str, target: str, content: Optional[str],
     )
 
 
+def _removal_token_error(
+    target: str,
+    action: Optional[str],
+    old_text: Optional[str],
+    operations: Optional[List[Dict[str, Any]]],
+    approval_token: str,
+    session_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Gate any operation that deletes a memory entry.
+
+    Returns an error dict when the call must not proceed, or ``None`` when
+    there is nothing being removed (or the removal is authorised).
+
+    Only removals are gated. Adds and replaces can be undone by another write;
+    a removal destroys the only copy, and the 2026-09-08 incident was three
+    removals performed on the agent's own belief that approval had been given.
+    A ``replace`` is treated as a removal ONLY when it drops content entirely,
+    which is a delete wearing a replace's clothes.
+    """
+    from agent.approval_tokens import (
+        KIND_MEMORY_REMOVE,
+        get_registry,
+        memory_removal_subject,
+    )
+
+    targets: List[str] = []
+    if operations and isinstance(operations, list):
+        for op in operations:
+            op = op or {}
+            if op.get("action") == "remove" and op.get("old_text"):
+                targets.append(str(op["old_text"]))
+    elif action == "remove" and old_text:
+        targets.append(str(old_text))
+
+    if not targets:
+        return None
+
+    registry_ = get_registry()
+    unauthorised: List[str] = []
+    for entry in targets:
+        subject = memory_removal_subject(entry)
+        ok, _reason = registry_.consume(
+            token=approval_token,
+            kind=KIND_MEMORY_REMOVE,
+            subject_id=subject,
+            session_id=session_id,
+        )
+        if not ok:
+            unauthorised.append(entry)
+
+    if not unauthorised:
+        return None
+
+    shown = [
+        {"entry": e, "approve_with": f"/approve {memory_removal_subject(e)}"}
+        for e in unauthorised
+    ]
+    return {
+        "success": False,
+        "error": (
+            f"{len(unauthorised)} removal(s) refused: no approval token names "
+            "these entries. A removal destroys the only copy, so it needs an "
+            "explicit user turn — not your reading of the conversation."
+        ),
+        "entries_requiring_approval": shown,
+        "note": (
+            "Show the user each entry verbatim and stop. Do not retry, do not "
+            "re-word the removal, and do not substitute a replace that drops "
+            "the content."
+        ),
+    }
+
+
 def _apply_batch_write_gate(target: str, operations: List[Dict[str, Any]]) -> Optional[str]:
     """Evaluate the write gate for a batch of memory operations.
 
@@ -1171,6 +1244,8 @@ def memory_tool(
     new_text: str = None,
     operations: Optional[List[Dict[str, Any]]] = None,
     store: Optional[MemoryStore] = None,
+    approval_token: str = "",
+    session_id: str = "",
 ) -> str:
     """
     Single entry point for the memory tool. Dispatches to MemoryStore methods.
@@ -1213,6 +1288,18 @@ def memory_tool(
     # re-deriving the same at-capacity error.
     if getattr(store, "_session_memory_latched", False):
         return json.dumps(store._session_latched_response(), ensure_ascii=False)
+
+    # Removal gate: an operation that DELETES an entry needs a token the
+    # harness minted from a user turn naming that entry. On 2026-09-08 three
+    # entries were removed after the agent offered to wait for approval and
+    # never received it — its own belief that consent existed was the only
+    # thing checked. Additions and replacements are not gated: they are
+    # recoverable, removals are not.
+    removal_error = _removal_token_error(
+        target, action, old_text, operations, approval_token, session_id
+    )
+    if removal_error is not None:
+        return json.dumps(removal_error, ensure_ascii=False)
 
     # --- Batch path -------------------------------------------------------
     if operations:

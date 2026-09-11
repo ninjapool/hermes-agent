@@ -337,21 +337,50 @@ class TestMemoryBatch:
     def test_batch_add_and_remove_atomic(self, store):
         store.add("memory", "stale one")
         store.add("memory", "stale two")
+        # Removals now require an approval token minted from a user turn
+        # (present_draft PR, item 2). The batch stays atomic; the gate only
+        # changes who may authorise the destructive half.
+        from agent.approval_tokens import (
+            KIND_MEMORY_REMOVE,
+            get_registry,
+            memory_removal_subject,
+        )
+
+        reg = get_registry()
+        tok_one = reg.mint(
+            KIND_MEMORY_REMOVE, memory_removal_subject("stale one"), "sess_batch"
+        )
         result = json.loads(memory_tool(
             target="memory",
             operations=[
                 {"action": "remove", "old_text": "stale one"},
-                {"action": "remove", "old_text": "stale two"},
                 {"action": "add", "content": "fresh durable fact"},
             ],
             store=store,
+            approval_token=tok_one.token,
+            session_id="sess_batch",
         ))
         assert result["success"] is True
         assert result["done"] is True
         assert "fresh durable fact" in store.memory_entries
         assert "stale one" not in store.memory_entries
-        assert "stale two" not in store.memory_entries
         assert "usage" in result
+
+    def test_batch_removal_without_token_is_refused_atomically(self, store):
+        """The destructive half cannot ride along on an approved add."""
+        store.add("memory", "stale two")
+        result = json.loads(memory_tool(
+            target="memory",
+            operations=[
+                {"action": "remove", "old_text": "stale two"},
+                {"action": "add", "content": "would-be companion add"},
+            ],
+            store=store,
+            session_id="sess_batch",
+        ))
+        assert result["success"] is False
+        assert "stale two" in store.memory_entries
+        assert "would-be companion add" not in store.memory_entries
 
 
     def test_batch_new_text_alias_for_content(self, store):
