@@ -196,6 +196,15 @@ TOOLSETS = {
         "tools": ["cronjob"],
         "includes": []
     },
+
+    # Not in _HERMES_CORE_TOOLS on purpose: only sessions that actually draft
+    # outbound mail should pay this tool's schema. Enable per-platform via
+    # `hermes tools` or tools.<platform>.enabled in config.yaml.
+    "email_draft": {
+        "description": "Render email drafts for human review with attachments made openable (present_draft)",
+        "tools": ["present_draft"],
+        "includes": []
+    },
     
 
     "file": {

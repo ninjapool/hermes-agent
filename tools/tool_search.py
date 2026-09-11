@@ -229,9 +229,16 @@ def _core_tool_names() -> frozenset[str]:
         return frozenset()
 
 
-# Session-gated GUI toolsets. Off ``_HERMES_CORE_TOOLS`` so non-GUI clients
-# never pay their schema; once a session enables them they stay direct.
-_DIRECT_SURFACE_TOOLSETS = frozenset({"desktop_ui", "project"})
+# Session-gated toolsets that stay DIRECT once enabled. Off
+# ``_HERMES_CORE_TOOLS`` so clients that don't need them never pay their
+# schema, but a session that opts in must see them eagerly.
+#
+# ``email_draft`` belongs here for a correctness reason, not a cost one:
+# ``present_draft`` exists to make an unreviewable draft impossible to
+# produce, and a gate the model has to discover via ``tool_search`` is a gate
+# it will hand-write around — which is the exact 2026-09-08 failure the tool
+# was built to stop. Enabling the toolset IS the opt-in; deferral would undo it.
+_DIRECT_SURFACE_TOOLSETS = frozenset({"desktop_ui", "project", "email_draft"})
 
 
 def is_deferrable_tool_name(name: str) -> bool:

@@ -173,6 +173,16 @@ class MemoryStore:
     # turn to budget exhaustion and suppress the user's reply (issue #42405).
     _MAX_CONSOLIDATION_FAILURES_PER_TURN = 3
 
+    # Session-scoped ceiling on at-capacity consolidation failures. The
+    # per-turn cap above resets at every turn boundary, so a store that is
+    # genuinely full re-issues the same doomed batch turn after turn: on
+    # 2026-09-08 a session burned four refusals, received the terminal
+    # "stop retrying" verdict, and then issued four MORE calls 44 minutes
+    # later in a later turn, with the per-turn counter blind to the earlier
+    # ones. This ceiling spans turns and latches; only a successful write or
+    # explicit user authorisation clears it.
+    _MAX_CONSOLIDATION_FAILURES_PER_SESSION = 6
+
     def __init__(
         self,
         memory_char_limit: int = 2200,
@@ -192,27 +202,94 @@ class MemoryStore:
         # Per-turn counter of failed at-capacity consolidation attempts; reset
         # at each turn boundary by reset_consolidation_failures() (#42405).
         self._consolidation_failures = 0
+        # Session-scoped counter and latch. Survives turn boundaries so that
+        # repeated at-capacity thrash across turns is bounded, not just within
+        # one turn. Cleared by a successful write or authorize_memory_retries().
+        self._session_consolidation_failures = 0
+        self._session_memory_latched = False
 
     def target_enabled(self, target: str) -> bool:
         """Return whether this session's selected built-in store is writable."""
         return self.user_profile_enabled if target == "user" else self.memory_enabled
 
     def reset_consolidation_failures(self) -> None:
-        """Reset the per-turn consolidation-failure counter (call at turn start)."""
+        """Reset the per-turn consolidation-failure counter (call at turn start).
+
+        Deliberately does NOT clear the session-scoped counter: the per-turn
+        cap stops a single runaway loop, but an at-capacity store produces the
+        same refusal every turn, so a turn-scoped counter alone lets the thrash
+        resume from zero on the next turn (observed 2026-09-08: four refusals,
+        a terminal "stop retrying" verdict, then four more calls 44 minutes
+        later in a later turn — the per-turn cap could not see them). Only a
+        successful write or explicit user authorisation clears the session
+        counter; see ``authorize_memory_retries``.
+        """
         self._consolidation_failures = 0
+
+    def authorize_memory_retries(self) -> None:
+        """Clear the session-scoped failure budget (explicit user authorisation).
+
+        The session cap latches: once tripped, memory writes stay refused for
+        the rest of the session. This is the ONLY way to lift it without a
+        successful write, and it must be driven by a user turn that actually
+        asks for memory work — never by the model deciding it has waited long
+        enough.
+        """
+        self._session_consolidation_failures = 0
+        self._session_memory_latched = False
+
+    def _session_latched_response(self) -> Dict[str, Any]:
+        """Terminal refusal once the session-scoped budget is exhausted.
+
+        Deliberately does NOT include a retry recipe: the model has already
+        been given one on every prior failure and has spent the budget. The
+        remedy is a human decision (prune, raise the cap, or drop the fact),
+        so the response routes the model to the user instead of to another
+        doomed batch.
+        """
+        return {
+            "success": False,
+            "done": True,
+            "latched": True,
+            "error": (
+                f"Memory writes are disabled for this session: "
+                f"{self._session_consolidation_failures} at-capacity failures "
+                "across multiple turns. Do NOT call the memory tool again this "
+                "session. The store is full and needs a human decision — tell "
+                "the user the fact could not be saved, quote it, and ask "
+                "whether to prune. Do not remove entries on your own judgement."
+            ),
+        }
 
     def _consolidation_failure(self, response: Dict[str, Any]) -> Dict[str, Any]:
         """Count an at-capacity consolidation failure and degrade gracefully.
 
-        Under the per-turn cap, return ``response`` unchanged (it already tells
-        the model how to self-correct + retry in this turn). Once the cap is
-        exceeded, drop the retry instruction and return a TERMINAL result so the
-        model stops looping memory calls and proceeds to answer the user — a
-        failed memory side effect must never block the turn's reply (#42405).
+        Two nested budgets:
+
+        * **Per-turn** (#42405): under the cap, return ``response`` unchanged
+          (it already tells the model how to self-correct + retry in this
+          turn). Over it, return a TERMINAL result so the model stops looping
+          and answers the user — a failed memory side effect must never block
+          the turn's reply.
+        * **Per-session**: the per-turn counter resets at every turn boundary,
+          so an at-capacity store re-issues the same doomed batch turn after
+          turn. The session counter survives those boundaries and LATCHES:
+          once tripped, memory writes are refused for the rest of the session
+          until a successful write or ``authorize_memory_retries()`` clears
+          it. Cleared only by those two paths — never by the model's own
+          judgement that it has waited long enough.
         """
         self._consolidation_failures += 1
-        if self._consolidation_failures <= self._MAX_CONSOLIDATION_FAILURES_PER_TURN:
+        self._session_consolidation_failures += 1
+        if self._session_consolidation_failures > self._MAX_CONSOLIDATION_FAILURES_PER_SESSION:
+            self._session_memory_latched = True
+        if (
+            self._consolidation_failures <= self._MAX_CONSOLIDATION_FAILURES_PER_TURN
+            and not self._session_memory_latched
+        ):
             return response
+        if self._session_memory_latched:
+            return self._session_latched_response()
         return {
             "success": False,
             "done": True,
@@ -726,8 +803,11 @@ class MemoryStore:
     def _success_response(self, target: str, message: str = None) -> Dict[str, Any]:
         # A successful write means the consolidation loop made progress, so the
         # per-turn failure budget resets (the cap counts consecutive failures,
-        # not lifetime ones within a turn) (#42405).
+        # not lifetime ones within a turn) (#42405). The session budget clears
+        # for the same reason: progress proves the store is writable again.
         self._consolidation_failures = 0
+        self._session_consolidation_failures = 0
+        self._session_memory_latched = False
         entries = self._entries_for(target)
         current = self._char_count(target)
         limit = self._char_limit(target)
@@ -1125,6 +1205,14 @@ def memory_tool(
     target_error = _memory_target_error(store, target)
     if target_error is not None:
         return json.dumps(target_error)
+
+    # Session latch: once the cross-turn consolidation budget is spent, refuse
+    # at the entry point so no write work runs on either path. Checked here
+    # rather than only in _consolidation_failure so the refusal is uniform for
+    # batch and single-op calls, and so a latched session cannot burn budget
+    # re-deriving the same at-capacity error.
+    if getattr(store, "_session_memory_latched", False):
+        return json.dumps(store._session_latched_response(), ensure_ascii=False)
 
     # --- Batch path -------------------------------------------------------
     if operations:
