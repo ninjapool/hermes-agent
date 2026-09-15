@@ -462,6 +462,57 @@ def _digest_history(messages_snapshot: List[Dict], tail: int = 24) -> List[Dict]
 # the user-message that the forked review agent receives.  AIAgent exposes
 # them as class attributes (``_MEMORY_REVIEW_PROMPT`` etc.) for back-compat;
 # the actual text lives here so future edits are one-place.
+
+# Shared admission test for memory writes. The store is small and capped; an
+# entry that duplicates a skill or a topic file spends scarce chars to say
+# something the agent could already look up, and a PROCEDURE written into
+# memory is re-read every turn as a standing instruction. Injected verbatim
+# into both the memory-only and the combined review prompts so the two paths
+# cannot drift.
+_MEMORY_ADMISSION_RULES = (
+    "**Before writing ANY memory entry, run this admission test. "
+    "It is a gate, not advice — an entry that fails it must not be "
+    "written.**\n\n"
+    "1. CHECK FOR AN EXISTING HOME FIRST (mandatory, do this before "
+    "composing the entry). Search the skill library and the topic/"
+    "reference files for the fact you are about to save: call "
+    "skills_list, skill_view on any skill that plausibly covers the "
+    "territory, and check any topic or notes file the conversation "
+    "referenced. If the fact is ALREADY recorded in a skill or a topic "
+    "file, write NOTHING to memory. At most, if a future session would "
+    "not know to look there, write a ONE-LINE pointer naming the "
+    "location (e.g. 'X→skill <name>') and nothing else — never a second "
+    "copy of the content. Two copies of a fact is worse than one, "
+    "because they drift and the memory copy wins by being always in "
+    "context.\n\n"
+    "2. PROCEDURES GO TO SKILLS, NEVER TO MEMORY. If the thing you want "
+    "to save is a sequence of steps, a command to run, an approval or "
+    "escalation workflow, or a how-to of any kind — how to approve a "
+    "removal, how to restart the gateway, how to mint a token, how to "
+    "deploy something — it belongs in the skill that governs that class "
+    "of task. Put it there with skill_manage. Do not put it in memory, "
+    "and do not put a copy in both. Memory holds who the user is and "
+    "what the durable state of the world is; skills hold how to do "
+    "things.\n\n"
+    "3. APPLY THE SAME THREE-PART TEST THE STORE USES. An entry earns a "
+    "slot only if ALL THREE hold:\n"
+    "   • NEEDED BEFORE KNOWING THE TASK — the agent must already have "
+    "it at the start of a turn to act correctly. If it only matters "
+    "once you are doing a specific task, the skill for that task "
+    "carries it.\n"
+    "   • NOT RETRIEVABLE ON DEMAND — it cannot be looked up when "
+    "needed from a file, a database, a skill, or a command. If a "
+    "one-line command or file read would produce it, save at most the "
+    "pointer, not the value.\n"
+    "   • STABLE FOR MONTHS — it will still be true months from now. "
+    "Current status, in-flight task state, this week's numbers, and "
+    "anything that resolves shortly belong in session history, not the "
+    "store.\n"
+    "   Failing any one of the three means do not write it.\n\n"
+    "If the entry fails the gate, that is a SUCCESSFUL review, not a "
+    "missed one. Say what you checked and why you wrote nothing.\n\n"
+)
+
 _MEMORY_REVIEW_PROMPT = (
     "Review the conversation above and consider saving to memory if appropriate.\n\n"
     "Focus on:\n"
@@ -469,8 +520,10 @@ _MEMORY_REVIEW_PROMPT = (
     "preferences, or personal details worth remembering?\n"
     "2. Has the user expressed expectations about how you should behave, their work "
     "style, or ways they want you to operate?\n\n"
-    "If something stands out, save it using the memory tool. "
-    "If nothing is worth saving, just say 'Nothing to save.' and stop."
+    + _MEMORY_ADMISSION_RULES +
+    "If something stands out AND it passes the admission test above, save it "
+    "using the memory tool. "
+    "If nothing passes, just say 'Nothing to save.' and stop."
 )
 
 _SKILL_REVIEW_PROMPT = (
@@ -618,6 +671,7 @@ _COMBINED_REVIEW_PROMPT = (
     "desires, preferences, personal details, or expectations about "
     "how you should behave? Save facts about the user and durable "
     "preferences with the memory tool.\n\n"
+    + _MEMORY_ADMISSION_RULES +
     "**Skills**: how to do this class of task. Be ACTIVE — most "
     "sessions produce at least one skill update. A pass that does "
     "nothing is a missed learning opportunity, not a neutral outcome.\n\n"
