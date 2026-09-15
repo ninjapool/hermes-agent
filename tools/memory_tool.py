@@ -1121,17 +1121,54 @@ def _removal_token_error(
         return None
 
     registry_ = get_registry()
+
+    # TWO passes, deliberately. consume() spends a token on any outcome, so a
+    # single-pass loop over a ten-entry batch would spend the approvals for the
+    # entries that WERE approved and then refuse the whole batch because one
+    # was not — burning the user's consent on a write that never happened, and
+    # forcing them to re-approve entries they already approved.
+    #
+    # Pass 1 resolves a candidate token per entry WITHOUT spending anything.
+    # Pass 2 spends only when every entry is covered.
+    resolved: List[tuple] = []
     unauthorised: List[str] = []
     for entry in targets:
         subject = memory_removal_subject(entry)
-        ok, _reason = registry_.consume(
-            token=approval_token,
+        # Resolution order mirrors send_draft: an explicitly passed token
+        # first, then the registry keyed by (kind, subject, session).
+        #
+        # The registry lookup is what makes a pasted approval work at all. The
+        # user types ``/approve mem_…`` in one turn; the gateway mints there and
+        # the turn then reaches the agent, which calls this tool later with no
+        # token string in hand — there is no parameter the user could fill. A
+        # batch is worse: ONE ``approval_token`` argument cannot carry ten
+        # approvals, so without this every removal after the first would fail
+        # even though the user approved them all.
+        #
+        # This is not a weakening of the gate. find_unspent still requires that
+        # a real ``/approve <this exact subject>`` was typed by a human, in this
+        # session, within the TTL, and consume() below performs the one-shot
+        # spend with all four checks.
+        token = approval_token or registry_.find_unspent(
             kind=KIND_MEMORY_REMOVE,
             subject_id=subject,
             session_id=session_id,
-        )
-        if not ok:
+        ) or ""
+        if not token:
             unauthorised.append(entry)
+        else:
+            resolved.append((entry, subject, token))
+
+    if not unauthorised:
+        for entry, subject, token in resolved:
+            ok, _reason = registry_.consume(
+                token=token,
+                kind=KIND_MEMORY_REMOVE,
+                subject_id=subject,
+                session_id=session_id,
+            )
+            if not ok:
+                unauthorised.append(entry)
 
     if not unauthorised:
         return None
@@ -1558,7 +1595,11 @@ registry.register(
         old_text=args.get("old_text"),
         new_text=args.get("new_text"),
         operations=args.get("operations"),
-        store=kw.get("store")),
+        store=kw.get("store"),
+        # Registry dispatch path (CLI / non-gateway callers). session_id comes
+        # from the runtime kwargs, never from ``args`` — the model must not be
+        # able to name the session its approval is checked against.
+        session_id=kw.get("session_id", "") or ""),
     check_fn=check_memory_requirements,
     emoji="🧠",
     dynamic_schema_overrides=_build_memory_schema_overrides,

@@ -2171,6 +2171,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     old_text=next_args.get("old_text"),
                     operations=operations,
                     store=agent._memory_store,
+                    # The removal gate looks up the approval the user minted by
+                    # typing "/approve mem_…" earlier in THIS session. Without
+                    # the session id the lookup cannot match (find_unspent
+                    # requires it), so every approved removal would still be
+                    # refused. The model does not supply this — it comes from
+                    # the runtime, which is the point.
+                    session_id=getattr(agent, "session_id", "") or "",
                 )
                 # Mirror successful built-in memory writes to external
                 # providers. All gating/op-expansion lives behind the manager

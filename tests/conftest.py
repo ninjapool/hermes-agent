@@ -519,6 +519,12 @@ def _hermetic_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("TZ", "UTC")
     monkeypatch.setenv("LANG", "C.UTF-8")
     monkeypatch.setenv("LC_ALL", "C.UTF-8")
+    # present_draft stages attachments to a remote host over ssh/scp. Unit
+    # tests must never depend on that hop being reachable (or fast): under
+    # parallel workers the round-trip timed out and drafts silently failed to
+    # render. Tests that specifically exercise staging opt back in by
+    # deleting this var.
+    monkeypatch.setenv("HERMES_DRAFT_SKIP_CYPRESS", "1")
     monkeypatch.setenv("PYTHONHASHSEED", "0")
 
     # 4b. Disable AWS IMDS lookups. Without this, any test that ends up

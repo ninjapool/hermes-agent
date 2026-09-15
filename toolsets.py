@@ -55,6 +55,11 @@ _HERMES_CORE_TOOLS = [
     "browser_exec",
     # Text-to-speech
     "text_to_speech",
+    # Email draft review. In core on purpose: an outbound draft can be composed
+    # in ANY session (CLI, desktop, Telegram, cron), and the review gate must
+    # never depend on the tool having been discovered first. Cheap schema, and
+    # the alternative failure mode is an unreviewable draft.
+    "present_draft",
     # Planning & memory
     "todo", "memory",
     # NOTE: the desktop Project tools (project_list/create/switch) are
@@ -197,9 +202,10 @@ TOOLSETS = {
         "includes": []
     },
 
-    # Not in _HERMES_CORE_TOOLS on purpose: only sessions that actually draft
-    # outbound mail should pay this tool's schema. Enable per-platform via
-    # `hermes tools` or tools.<platform>.enabled in config.yaml.
+    # In _HERMES_CORE_TOOLS on purpose: a draft with attachments can be
+    # composed in any session, and the review gate must not be reachable only
+    # after tool discovery. Kept as its own toolset so `hermes tools` can still
+    # list and toggle it per platform.
     "email_draft": {
         "description": "Render email drafts for human review with attachments made openable (present_draft)",
         "tools": ["present_draft"],

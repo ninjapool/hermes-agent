@@ -3446,6 +3446,11 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 old_text=next_args.get("old_text"),
                 operations=operations,
                 store=agent._memory_store,
+                # Sibling of the tool_executor path. The removal gate resolves
+                # the user's "/approve mem_…" approval by (kind, subject,
+                # session); without the session id it can never match, so an
+                # approved removal would still be refused on this path.
+                session_id=getattr(agent, "session_id", "") or "",
             )
             # Mirror successful built-in memory writes to external providers.
             # All gating/op-expansion lives behind the manager interface

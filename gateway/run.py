@@ -8178,6 +8178,131 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "the session attached to the current topic."
         )
 
+    def _try_mint_draft_approval_token(self, text: str, session_key: str):
+        """Try to mint a draft-approval token if text matches /approve <draft-id>.
+        
+        Called synchronously from the gateway's message dispatch BEFORE the
+        dangerous-command /approve handler runs. Checks if this is /approve
+        followed by an id that names an EXISTING persisted draft. If so, mints a
+        KIND_DRAFT token, stores it in a contextvar for send_draft to read, and
+        returns the token. Otherwise returns None so the message falls through to
+        the dangerous-command handler unchanged.
+        
+        This preserves the important invariant: /approve (bare), /approve all,
+        /approve session, /approve always must still reach the dangerous-command
+        handler. Only draft-specific approvals take the token path.
+        
+        The contextvar is set in the caller's context, so send_draft (running
+        later in the same event loop context) can read it.
+        
+        Args:
+            text: The raw user message text (e.g., "/approve draft_20260914_b9bce5")
+            session_key: The gateway session key (for token binding)
+        
+        Returns:
+            The minted ApprovalToken if a draft-id was recognized and the draft
+            exists, otherwise None.
+        """
+        from agent.approval_tokens import (
+            KIND_DRAFT, get_registry, set_draft_approval_token,
+        )
+        from tools.present_draft import load_draft
+
+        # The token must be bound to the SAME identifier the consuming tool
+        # will present. The tool side receives ``agent.session_id`` (e.g.
+        # '20260914_153449_196114dd'), NOT the gateway session key (e.g.
+        # 'agent:main:telegram:dm:8468018784'). Binding to the key made the
+        # gate unopenable: consume() would always report "approval token
+        # belongs to a different session".
+        #
+        # Verified 2026-09-15 by printing both, raw:
+        #   session_key (mint)   : 'agent:main:telegram:dm:8468018784'
+        #   session_id  (consume): '20260914_153449_196114dd'
+        #   EQUAL?: False
+        #
+        # peek_session_id() is a read-only lookup — it does not create a
+        # session. If there is no live session for this key, there is nothing
+        # to approve, so returning None (falling through to the dangerous
+        # command handler) is the correct, fail-closed behaviour.
+        bind_session = session_key
+        store = getattr(self, "session_store", None)
+        if store is not None:
+            try:
+                resolved = store.peek_session_id(session_key)
+            except Exception:
+                resolved = None
+            if resolved:
+                bind_session = resolved
+            else:
+                return None
+        
+        # Mint will return None if text doesn't match the regex or doesn't carry
+        # a subject_id. This is the single regex door: no second regex here.
+        reg = get_registry()
+        token = reg.mint_from_user_text(text, kind=KIND_DRAFT, session_id=bind_session)
+        if token is None:
+            return None
+        
+        # Token matched the regex, BUT we must verify the subject_id names an
+        # actual draft. If the draft doesn't exist, discard the token and return
+        # None so the message falls through to the dangerous-command handler.
+        draft = load_draft(token.subject_id)
+        if draft is None:
+            return None
+        
+        # Draft exists; keep the token and make it available to send_draft via
+        # the contextvar. The contextvar is set in the same context that will
+        # run the agent, so send_draft can read it.
+        set_draft_approval_token(token.token)
+        return token
+
+    def _try_mint_memory_approval_tokens(self, text: str, session_key: str):
+        """Mint KIND_MEMORY_REMOVE tokens from ``/approve mem_…`` lines.
+
+        The memory analogue of ``_try_mint_draft_approval_token``, with two
+        differences that come from how memory approvals are actually used:
+
+        * **Many per message.** A prune refuses N removals at once and issues N
+          ``/approve mem_…`` lines. The user pastes the block back, so one
+          message must mint N tokens.
+        * **Trailing text ignored.** Those lines were shown with the entry text
+          alongside ("/approve mem_ab12  [16] Client docs…") and come back that
+          way. The draft path's whole-string anchor would reject every one.
+
+        What is NOT relaxed: the id must be a literal ``mem_<hex>``, the shape
+        ``memory_removal_subject`` produces, anchored at a line start. Bare
+        ``/approve``, ``/approve all`` and unknown ids mint nothing and fall
+        through to the dangerous-command handler.
+
+        There is no draft-style existence check. A memory subject is a hash of
+        the entry text, so "does it name something real?" is answered at spend
+        time by ``consume()``: a token for an id that matches no entry simply
+        never matches, and the removal stays refused. Returns the list of
+        minted tokens (empty when the text carries none).
+        """
+        from agent.approval_tokens import get_registry
+
+        # Bind to the SAME identifier the tool will present — agent.session_id,
+        # not the gateway session key. Binding to the key is what made the
+        # draft gate unopenable before it was fixed; the memory gate consumes
+        # with agent.session_id for exactly the same reason.
+        bind_session = session_key
+        store = getattr(self, "session_store", None)
+        if store is not None:
+            try:
+                resolved = store.peek_session_id(session_key)
+            except Exception:
+                resolved = None
+            if resolved:
+                bind_session = resolved
+            else:
+                # No live session means nothing to approve. Fail closed.
+                return []
+
+        return get_registry().mint_memory_approvals_from_user_text(
+            text, session_id=bind_session
+        )
+
     def _record_telegram_topic_binding(
         self,
         source: SessionSource,
@@ -18376,8 +18501,95 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     canonical = _cmd_def.name if _cmd_def else command
                     break
 
+        # ── Draft approval token minting ──────────────────────────────
+        # Before dispatching to the dangerous-command /approve handler, check if
+        # this is /approve <draft-id> for an EXISTING persisted draft. If so,
+        # mint a KIND_DRAFT token and store it in a contextvar for send_draft to
+        # use. This keeps the token out of the prompt (preserving cache stability
+        # and strict role alternation) and reuses mint_from_user_text as the
+        # single source of regex truth.
+        #
+        # If the draft id does not resolve (unknown id), fall through to the
+        # normal dangerous-command handler unchanged, so unrecognised ids
+        # behave exactly as before (no pending dangerous command -> "No pending
+        # command to approve").
+        try:
+            from tools.approval import has_blocking_approval as _has_blocking_approval
+        except ImportError:
+            _has_blocking_approval = None
+
+        # Set True only when we actually mint a draft token below, so the
+        # plain /approve handler is bypassed for exactly that case and every
+        # other /approve (bare, /approve all, unknown id) behaves as before.
+        _skip_approve_handler = False
+        
+        if (
+            canonical == "approve"
+            and event.text
+            and _has_blocking_approval is not None
+            and not _has_blocking_approval(_quick_key)
+        ):
+            # FIXED (2026-09-15): Mint, then FALL THROUGH.
+            #
+            # The previous version returned a "✓ Token minted … Sending…" string
+            # here. That was doubly wrong:
+            #
+            #   1. It swallowed the user's message. Returning from the dispatch
+            #      handler meant the turn never reached the agent, so nothing
+            #      ever called send_email. The gate minted an approval and then
+            #      dropped it on the floor.
+            #   2. It told the user "Sending…" when nothing was sending. A
+            #      status line that reports an action nobody performed is worse
+            #      than no status line at all.
+            #
+            # Minting is a side effect of seeing /approve <draft-id>; it is not
+            # a reply. So we mint and let the message continue to the agent as a
+            # normal user turn. The agent sees the /approve text, calls
+            # send_email, and send_draft finds the token via the registry.
+            #
+            # Fall-through pattern mirrors /learn below: the turn proceeds to
+            # normal agent processing rather than being answered by a command
+            # handler. We must ALSO skip the plain "approve" handler, because
+            # that would swallow the turn just as surely as the old `return`
+            # did — it would answer "No pending command to approve" and the
+            # agent would never see the message.
+            _minted_draft_token = self._try_mint_draft_approval_token(
+                event.text, _quick_key
+            )
+            if _minted_draft_token is not None:
+                logger.info(
+                    "draft approval: minted token for subject=%r session=%r; "
+                    "falling through to agent turn",
+                    _minted_draft_token.subject_id,
+                    _quick_key,
+                )
+                _skip_approve_handler = True
+            else:
+                # Same fall-through, for memory-removal approvals. Ordered
+                # AFTER the draft attempt and BEFORE the dangerous-command
+                # handler: a bare /approve, /approve all, or an unrecognised id
+                # still reaches that handler untouched.
+                #
+                # A memory prune approves a LIST — the user pastes the ten
+                # "/approve mem_…" lines the tool issued, usually with the
+                # entry text still trailing each one. So this mints per line
+                # and ignores trailing text, which the single-subject draft
+                # path (anchored ^…$) cannot do.
+                _minted_memory_tokens = self._try_mint_memory_approval_tokens(
+                    event.text, _quick_key
+                )
+                if _minted_memory_tokens:
+                    logger.info(
+                        "memory approval: minted %d token(s) for subjects=%r "
+                        "session=%r; falling through to agent turn",
+                        len(_minted_memory_tokens),
+                        [t.subject_id for t in _minted_memory_tokens],
+                        _quick_key,
+                    )
+                    _skip_approve_handler = True
+
         plain_handler = self._gateway_plain_command_handlers().get(canonical)
-        if plain_handler is not None:
+        if plain_handler is not None and not _skip_approve_handler:
             return await plain_handler(event)
 
         if canonical == "new":

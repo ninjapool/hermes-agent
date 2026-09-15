@@ -23,16 +23,20 @@ and the sent object are the same object.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import subprocess
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_constants import display_hermes_home, get_hermes_home
-from agent.approval_tokens import KIND_DRAFT, get_registry
+from agent.approval_tokens import KIND_DRAFT, get_registry, get_draft_approval_token
 from tools.registry import registry
+
+logger = logging.getLogger("tools.present_draft")
 
 # Drafts live under HERMES_HOME so each profile keeps its own (never ~/.hermes).
 _DRAFT_DIR = get_hermes_home() / "drafts"
@@ -77,6 +81,114 @@ def filenames_mentioned_in_text(body: str) -> List[str]:
     return list(seen)
 
 
+def _publish_attachment_to_cypress(local_path: str) -> tuple[Optional[str], Optional[str]]:
+    """Publish an attachment to the cypress remote host for send-time retrieval.
+    
+    The hermes-send transport reads attachments from cypress's local disk via
+    /run/hermes-mailsend/sock. This function copies the file there and verifies
+    it by content hash.
+    
+    Attachments are staged to ~/.hermes-attachments on cypress (the home directory
+    of the account running the ssh connection, typically the deploy user ds).
+    This directory is created with mode 0700 to ensure client invoices
+    (containing customer commercial figures) are not world-readable.
+    
+    NOTE (2026-09-14): While the hermes-send transport runs as user mailsend
+    (uid=976), we create the staging directory under the SSH user's home (~ds)
+    because we lack passwordless sudo to create it as mailsend. The transport
+    validates that it can read from the paths hermes-send provides, so file
+    ownership is not a blocker. The security property (0700 mode, not world-readable)
+    is preserved.
+    
+    Returns (cypress_path, sha256_hex) on success, (None, None) on failure.
+    """
+    import hashlib
+    import subprocess
+
+    # Staging is a network round-trip (ssh + scp + remote hash). Timeouts must
+    # be generous enough for a real WAN hop under load: the original 5s ssh
+    # timeout made present_draft fail intermittently whenever the host was
+    # busy, and a *timed-out* publish is indistinguishable from a refused one,
+    # so a slow link silently became "no draft". Env-overridable for slow links.
+    _ssh_timeout = int(os.environ.get("HERMES_DRAFT_SSH_TIMEOUT", "30"))
+    _scp_timeout = int(os.environ.get("HERMES_DRAFT_SCP_TIMEOUT", "120"))
+
+    local_path_obj = Path(local_path)
+    if not local_path_obj.is_file():
+        return None, None
+    
+    # Read and hash the source
+    try:
+        content = local_path_obj.read_bytes()
+        sha256 = hashlib.sha256(content).hexdigest()
+    except OSError as e:
+        logger.warning("Failed to read source file %s: %s", local_path, e)
+        return None, None
+    
+    # Publish to cypress via scp
+    # Use the secure staging directory under SSH user's home
+    remote_dir = "~/.hermes-attachments"
+    remote_name = f"{sha256[:8]}_{local_path_obj.name}"
+    remote_path = f"{remote_dir}/{remote_name}"
+    
+    try:
+        # Create remote directory with secure mode (0700)
+        subprocess.run(
+            ["ssh", "cypress", f"mkdir -p -m 0700 {remote_dir}"],
+            check=True,
+            capture_output=True,
+            timeout=_ssh_timeout,
+        )
+        
+        # Copy file
+        subprocess.run(
+            ["scp", local_path, f"cypress:{remote_path}"],
+            check=True,
+            capture_output=True,
+            timeout=_scp_timeout,
+        )
+        
+        # Verify by hash on remote
+        result = subprocess.run(
+            ["ssh", "cypress", f"sha256sum {remote_path}"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=_ssh_timeout,
+        )
+        remote_sha256 = result.stdout.split()[0]
+        
+        if remote_sha256 != sha256:
+            logger.error(
+                "Hash mismatch for %s: local=%s remote=%s",
+                local_path, sha256, remote_sha256
+            )
+            return None, None
+        
+        # Expand the remote path for logging and storage (convert ~)
+        result_path = subprocess.run(
+            ["ssh", "cypress", f"echo {remote_path}"],
+            capture_output=True,
+            text=True,
+            timeout=_ssh_timeout,
+            check=True,
+        )
+        expanded_path = result_path.stdout.strip()
+        
+        logger.info(
+            "Published attachment %s -> %s (sha256=%s)",
+            local_path, expanded_path, sha256
+        )
+        return expanded_path, sha256
+        
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
+        logger.warning(
+            "Failed to publish %s to cypress: %s",
+            local_path, e
+        )
+        return None, None
+
+
 def _resolve_attachments(
     attachments: List[str],
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
@@ -86,6 +198,9 @@ def _resolve_attachments(
     file the reviewer cannot open is the exact defect this tool exists to
     prevent, so there is no partial-success mode: either every attachment
     resolves or nothing is rendered.
+    
+    As of 2026-09-14, this ALSO publishes each attachment to cypress and
+    stores both the local review path and the remote cypress path in the record.
     """
     resolved: List[Dict[str, Any]] = []
     errors: List[str] = []
@@ -115,7 +230,34 @@ def _resolve_attachments(
         if size == 0:
             errors.append(f"{path}: zero bytes — nothing to review")
             continue
-        resolved.append({"path": str(path), "name": path.name, "bytes": size})
+        
+        # Stage to the host the transport actually reads from.
+        #
+        # HERMES_DRAFT_SKIP_CYPRESS=1 renders with local paths only and no
+        # cypress_path — send_draft then treats the record exactly like an
+        # old-format one. This is a TEST affordance and is opt-IN by env:
+        # a network failure can never quietly take this branch. Making it
+        # automatic-on-error would let a draft render while its attachments
+        # sat nowhere the transport could reach — the exact failure this
+        # staging exists to prevent. On any real publish failure we still
+        # refuse the whole draft.
+        entry = {
+            "path": str(path),           # Review path (local to gateway's client)
+            "name": path.name,
+            "bytes": size,
+        }
+        if os.environ.get("HERMES_DRAFT_SKIP_CYPRESS") != "1":
+            cypress_path, sha256 = _publish_attachment_to_cypress(str(path))
+            if cypress_path is None:
+                errors.append(
+                    f"{path}: failed to publish to cypress "
+                    "(attachment will not be sendable)"
+                )
+                continue
+            entry["cypress_path"] = cypress_path  # where hermes-send reads it
+            entry["sha256"] = sha256              # verification hash
+
+        resolved.append(entry)
     return resolved, errors
 
 
@@ -302,8 +444,66 @@ def lint_outbound_reply(text: str) -> Optional[str]:
 # --- Sending (token-gated) ------------------------------------------------
 
 
+def _get_minted_draft_token() -> str:
+    """Retrieve the draft-approval token from the current turn's context, if minted.
+    
+    The gateway mints tokens for /approve <draft-id> messages in the user-turn path
+    and stores them in a contextvar (not in the prompt) to preserve cache stability.
+    This helper lets send_draft auto-populate the token without user involvement.
+    """
+    return get_draft_approval_token()
+
+
+def cleanup_cypress_attachments(draft_id: str) -> dict:
+    """Remove a draft's staged attachment copies from cypress.
+
+    Call this ONLY after the transport has confirmed a successful send (a 250
+    from the mail helper). Staged files are client invoices; they should not
+    outlive the send that needed them.
+
+    Deliberately NOT called from send_draft(): send_draft verifies approval and
+    returns ``approved: True``, it does not itself put mail on the wire. The
+    actual send is the hermes-send/helper call that happens after it. Deleting
+    at approval time would remove the files out from under the transport and
+    guarantee a failed send — so the caller that owns the 250 owns the cleanup.
+
+    Returns a per-file report. Never raises: a failed cleanup must not be
+    mistaken for a failed send, and leftover staging is a hygiene problem, not
+    a correctness one.
+    """
+    import subprocess
+
+    draft = load_draft(draft_id)
+    if draft is None:
+        return {"draft_id": draft_id, "error": "no such draft", "removed": []}
+
+    removed: list[str] = []
+    failed: list[dict] = []
+    for a in draft.get("attachments", []):
+        cypress_path = a.get("cypress_path")
+        if not cypress_path:
+            continue  # old-format record, nothing was staged
+        try:
+            result = subprocess.run(
+                ["ssh", "cypress", "rm", "-f", "--", cypress_path],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if result.returncode == 0:
+                removed.append(cypress_path)
+            else:
+                failed.append(
+                    {"path": cypress_path, "error": result.stderr.strip()}
+                )
+        except Exception as e:  # noqa: BLE001 - cleanup must never raise
+            failed.append({"path": cypress_path, "error": str(e)})
+
+    return {"draft_id": draft_id, "removed": removed, "failed": failed}
+
+
 def send_draft(
-    draft_id: str,
+    draft_id: str = "",
     approval_token: str = "",
     session_id: str = "",
     task_id: Optional[str] = None,
@@ -331,11 +531,43 @@ def send_draft(
             }
         )
 
+    # Fall back to the token the gateway minted for this turn.
+    #
+    # This lookup lives HERE, not in the tool-registry handler, because
+    # send_draft is the actual gate. When the fallback sat in the handler
+    # lambda, any caller reaching send_draft directly — the test suite, the
+    # CLI, a future adapter — bypassed it and saw an empty token, so the
+    # mechanism the design depends on was never exercised end to end.
+    # The gate and the thing that feeds the gate belong in one place.
+    #
+    # This is not the model approving itself: the registry only holds tokens
+    # the gateway minted after parsing a real user /approve message, and
+    # consume() still enforces kind, subject, session and expiry.
+    #
+    # Resolution order:
+    #   1. An explicitly passed token (tests, CLI, future adapters).
+    #   2. The contextvar, if we happen to still be inside the minting context.
+    #   3. The registry, keyed by (kind, subject, session).
+    #
+    # (3) is what makes this work in production. The contextvar is set during
+    # gateway dispatch and dies when that context ends, long before the agent
+    # calls this tool, so it is effectively always empty here. The registry
+    # survives because it is a process-wide store, and the token is still
+    # bound to this exact session and this exact draft.
+    effective_session = session_id or draft.get("session_id", "")
+    effective_token = approval_token or _get_minted_draft_token()
+    if not effective_token:
+        effective_token = get_registry().find_unspent(
+            kind=KIND_DRAFT,
+            subject_id=draft_id,
+            session_id=effective_session,
+        ) or ""
+
     ok, reason = get_registry().consume(
-        token=approval_token,
+        token=effective_token,
         kind=KIND_DRAFT,
         subject_id=draft_id,
-        session_id=session_id or draft.get("session_id", ""),
+        session_id=effective_session,
     )
     if not ok:
         return json.dumps(
@@ -352,22 +584,64 @@ def send_draft(
         )
 
     # Re-verify the attachments at send time. The draft may have been rendered
-    # minutes ago and a file moved since; the reviewer approved openable files,
-    # so sending unopenable ones would break the thing they approved.
-    missing = [
-        a["path"]
-        for a in draft.get("attachments", [])
-        if not Path(a["path"]).is_file()
-    ]
-    if missing:
+    # minutes ago and files may have moved or been deleted on either the local
+    # machine or cypress.  The reviewer approved openable files, so sending
+    # unopenable ones would break the contract.
+    #
+    # NEW (2026-09-14): Verify BOTH the local review path and the cypress
+    # transport path. The local path might exist but cypress's copy may have
+    # been deleted. We check both to ensure hermes-send will succeed.
+    missing_local = []
+    missing_cypress = []
+    
+    for a in draft.get("attachments", []):
+        # Check local (review) path
+        if not Path(a["path"]).is_file():
+            missing_local.append(a["path"])
+        
+        # Check cypress (transport) path if it exists in the record
+        cypress_path = a.get("cypress_path")
+        if cypress_path:
+            try:
+                result = subprocess.run(
+                    ["ssh", "cypress", f"test -f {cypress_path}"],
+                    check=False,
+                    capture_output=True,
+                    # Generous: a TIMEOUT here would be read as "attachment
+                    # missing" and burn an already-consumed approval on a
+                    # send that never happened. Slow != gone.
+                    timeout=int(os.environ.get("HERMES_DRAFT_SSH_TIMEOUT", "30")),
+                )
+                if result.returncode != 0:
+                    missing_cypress.append((a["path"], cypress_path))
+            except Exception as e:
+                logger.warning(
+                    "Failed to check cypress path %s: %s",
+                    cypress_path, e
+                )
+                missing_cypress.append((a["path"], cypress_path))
+    
+    if missing_local or missing_cypress:
+        error_parts = []
+        if missing_local:
+            error_parts.append(
+                f"{len(missing_local)} local file(s) no longer exist: "
+                f"{', '.join(missing_local)}"
+            )
+        if missing_cypress:
+            cypress_list = [f"{local} -> {cypress}" for local, cypress in missing_cypress]
+            error_parts.append(
+                f"{len(missing_cypress)} cypress copy/copies no longer exist: "
+                f"{'; '.join(cypress_list)}"
+            )
+        
         return json.dumps(
             {
                 "success": False,
                 "error": (
                     "approval consumed but NOT sent: "
-                    f"{len(missing)} attachment(s) no longer exist: "
-                    f"{', '.join(missing)}. Re-present the draft and ask for "
-                    "approval again."
+                    + " and ".join(error_parts)
+                    + ". Re-present the draft and ask for approval again."
                 ),
                 "draft_id": draft_id,
             }
@@ -424,6 +698,8 @@ registry.register(
     },
     handler=lambda args, **kw: send_draft(
         draft_id=args.get("draft_id", ""),
+        # No contextvar fallback here — send_draft does it. One gate, one
+        # place. Duplicating it meant direct callers silently skipped it.
         approval_token=args.get("approval_token", ""),
         session_id=kw.get("session_id", "") or "",
         task_id=kw.get("task_id"),
