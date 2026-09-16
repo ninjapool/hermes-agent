@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import subprocess
 import time
 import uuid
@@ -81,6 +82,24 @@ def filenames_mentioned_in_text(body: str) -> List[str]:
     return list(seen)
 
 
+def _staged_attachment_location(local_path: Path, sha256: str) -> tuple[str, str]:
+    """Return ``(remote_dir, remote_name)`` for an attachment staged on cypress.
+
+    The filename is left CLEAN. The old scheme prefixed it with the first 8
+    hex of the digest (``d34d294f_invoice.pdf``) to keep two same-named files
+    from colliding in one flat staging directory — and that prefix rode all
+    the way out to the recipient, because the transport passes the staged
+    basename to the MIME part. The reviewer approved ``invoice.pdf`` and the
+    client received ``d34d294f_invoice.pdf``.
+
+    The collision safety was real, so it is kept: the hash moves into a
+    DIRECTORY component. Two files named ``invoice.pdf`` with different
+    content stage to different directories and keep their own names; the same
+    file staged twice lands on the same path, which is idempotent and correct.
+    """
+    return f"~/.hermes-attachments/{sha256[:8]}", local_path.name
+
+
 def _publish_attachment_to_cypress(local_path: str) -> tuple[Optional[str], Optional[str]]:
     """Publish an attachment to the cypress remote host for send-time retrieval.
     
@@ -127,14 +146,20 @@ def _publish_attachment_to_cypress(local_path: str) -> tuple[Optional[str], Opti
     
     # Publish to cypress via scp
     # Use the secure staging directory under SSH user's home
-    remote_dir = "~/.hermes-attachments"
-    remote_name = f"{sha256[:8]}_{local_path_obj.name}"
+    remote_dir, remote_name = _staged_attachment_location(local_path_obj, sha256)
     remote_path = f"{remote_dir}/{remote_name}"
     
     try:
-        # Create remote directory with secure mode (0700)
+        # Create remote directory with secure mode (0700). Both levels: the
+        # per-hash subdir AND its parent, or the parent lands on the default
+        # umask and the 0700 guarantee is only true of the leaf.
+        parent_dir = remote_dir.rsplit("/", 1)[0]
         subprocess.run(
-            ["ssh", "cypress", f"mkdir -p -m 0700 {remote_dir}"],
+            [
+                "ssh",
+                "cypress",
+                f"mkdir -p -m 0700 {parent_dir} && mkdir -p -m 0700 {remote_dir}",
+            ],
             check=True,
             capture_output=True,
             timeout=_ssh_timeout,
@@ -150,7 +175,7 @@ def _publish_attachment_to_cypress(local_path: str) -> tuple[Optional[str], Opti
         
         # Verify by hash on remote
         result = subprocess.run(
-            ["ssh", "cypress", f"sha256sum {remote_path}"],
+            ["ssh", "cypress", f"sha256sum {shlex.quote(remote_path)}"],
             check=True,
             capture_output=True,
             text=True,
@@ -261,19 +286,40 @@ def _resolve_attachments(
     return resolved, errors
 
 
+def _session_source() -> str:
+    """The current session's SOURCE, read the way production binds it.
+
+    Same rule as ``_structural_approval_surface``: read
+    ``HERMES_SESSION_SOURCE`` through ``get_session_env``, never the process
+    env directly and never ``HERMES_DESKTOP`` — one serve process answers many
+    sessions, and the platform var is empty on desktop/CLI/TUI
+    (gateway/session_context.py:419-424).
+    """
+    try:
+        from gateway.session_context import get_session_env
+
+        return (get_session_env("HERMES_SESSION_SOURCE", "") or "").strip().lower()
+    except Exception:
+        return (os.environ.get("HERMES_SESSION_SOURCE", "") or "").strip().lower()
+
+
 def _render(
     to: str,
     subject: str,
     body: str,
     cc: Optional[str],
     resolved: List[Dict[str, Any]],
+    from_addr: str = "",
 ) -> str:
     """Render the reviewable draft, attachment lines included.
 
     The model does not write these lines and cannot omit one: they are
     generated from the same list that will be sent.
     """
-    lines = [f"**To:** {to}"]
+    lines = []
+    if from_addr:
+        lines.append(f"**From:** {from_addr}")
+    lines.append(f"**To:** {to}")
     if cc:
         lines.append(f"**Cc:** {cc}")
     lines.append(f"**Subject:** {subject}")
@@ -297,14 +343,45 @@ def present_draft(
     body: str = "",
     cc: str = "",
     attachments: Optional[List[str]] = None,
+    session_id: str = "",
     task_id: Optional[str] = None,
+    **kwargs: Any,
 ) -> str:
     attachments = attachments or []
+    # ``from`` is a Python keyword, so it can only arrive via **kwargs.
+    from_addr = str(kwargs.get("from", "") or "").strip()
 
     missing = [n for n, v in (("to", to), ("subject", subject), ("body", body)) if not v]
     if missing:
         return json.dumps(
             {"success": False, "error": f"missing required field(s): {', '.join(missing)}"},
+            ensure_ascii=False,
+        )
+
+    # The sending identity is REQUIRED on desktop sessions and is never
+    # inferred. A default-account setting, an env var, or "the account we used
+    # last time" are all guesses, and the reviewer cannot check a guess they
+    # were never shown: the From address decides which thread the reply lands
+    # in and whether the recipient recognises the sender. Sending from the
+    # wrong identity cannot be undone, so the tool refuses rather than picks.
+    #
+    # Scoped to desktop because that is the surface with the approval card —
+    # the card is where the address gets reviewed. Messaging surfaces keep the
+    # prior contract unchanged.
+    if _session_source() == "desktop" and not from_addr:
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    "missing required field: from. The sending identity is "
+                    "never inferred — pass the full From address explicitly."
+                ),
+                "hint": (
+                    "Pass from='<full address>'. Verify it from a real Sent "
+                    "header rather than from an account nickname; if the "
+                    "correct mailbox is ambiguous, ask before drafting."
+                ),
+            },
             ensure_ascii=False,
         )
 
@@ -347,6 +424,13 @@ def present_draft(
     record = {
         "draft_id": draft_id,
         "created_at": time.time(),
+        # Provenance. The structural-approval path refuses to raise a card for
+        # a draft this session did not render: a draft file is visible to every
+        # process sharing HERMES_HOME (the Telegram gateway can read a draft
+        # this serve wrote), so the file's existence is not evidence that the
+        # reviewer on THIS surface ever saw it.
+        "session_id": session_id or "",
+        "from": from_addr,
         "to": to,
         "cc": cc,
         "subject": subject,
@@ -369,7 +453,7 @@ def present_draft(
             "success": True,
             "draft_id": draft_id,
             "attachment_count": len(resolved),
-            "rendered": _render(to, subject, body, cc, resolved),
+            "rendered": _render(to, subject, body, cc, resolved, from_addr),
             "note": (
                 "Post 'rendered' VERBATIM as your reply — the MEDIA: lines are "
                 "what make the files openable. Do not add, remove or reword an "
@@ -502,6 +586,115 @@ def cleanup_cypress_attachments(draft_id: str) -> dict:
     return {"draft_id": draft_id, "removed": removed, "failed": failed}
 
 
+def _draft_card_description(draft: Dict[str, Any]) -> str:
+    """Build the approval card's text from the draft RECORD alone.
+
+    Every character comes from persisted fields or from os.stat/hashlib; no
+    model-supplied string reaches the card except the recipient/subject values
+    that ARE the thing being approved (and which the reviewer already read in
+    the rendered draft). The body is deliberately NOT included: it is long,
+    model-authored prose, and the card must describe the ENVELOPE — who
+    receives what — which is the part a misdirected send gets wrong.
+
+    Attachment bytes and SHA-256 are recomputed from disk here rather than read
+    back from the record. A stale hash would describe the file as it was at
+    render time, and the whole point of the card is to describe what is about
+    to leave the machine.
+    """
+    import hashlib
+
+    lines = [
+        f"draft_id: {draft.get('draft_id', '')}",
+    ]
+    # The sending identity leads the card: it is the field a misdirected send
+    # gets wrong in the way that cannot be retracted.
+    if draft.get("from"):
+        lines.append(f"From: {draft.get('from')}")
+    lines.append(f"To: {draft.get('to', '')}")
+    if draft.get("cc"):
+        lines.append(f"Cc: {draft.get('cc')}")
+    lines.append(f"Subject: {draft.get('subject', '')}")
+
+    attachments = draft.get("attachments") or []
+    if not attachments:
+        lines.append("Attachments: none")
+    for i, att in enumerate(attachments, 1):
+        path = Path(str(att.get("path", "")))
+        name = path.name or "?"
+        try:
+            content = path.read_bytes()
+            size = len(content)
+            digest = hashlib.sha256(content).hexdigest()
+        except OSError:
+            # Unreadable now: say so on the card. The send-time re-verification
+            # below will refuse anyway, but the reviewer should not be asked to
+            # approve a file the machine cannot read.
+            lines.append(f"Attachment {i}/{len(attachments)}: {name} — UNREADABLE")
+            continue
+        lines.append(
+            f"Attachment {i}/{len(attachments)}: {name} — {size:,} bytes — "
+            f"sha256:{digest}"
+        )
+    return "\n".join(lines)
+
+
+def _structural_approval_surface() -> tuple[str, Any]:
+    """Return ``(session_key, notify_cb)`` when this surface can raise a card.
+
+    Scoped to desktop sessions. Messaging platforms keep the ``/approve
+    <draft_id>`` contract unchanged: they already have a working mint path
+    (gateway/run.py:8181), the token they mint is bound to the same process
+    that will spend it, and a card there would be a second, redundant consent
+    channel on a surface that does not need one.
+
+    Returns ``("", None)`` for every other surface, which leaves send_draft on
+    the token path and therefore fails closed.
+    """
+    try:
+        from tools.approval import (
+            _gateway_notify_cbs,
+            _lock,
+            get_current_session_key,
+        )
+    except Exception:  # pragma: no cover - approval module always importable
+        logger.debug("approval module unavailable for structural path", exc_info=True)
+        return "", None
+
+    # Read the SOURCE, not the platform. gateway/session_context.py:419-424:
+    # the gateway binds a platform value ("telegram") to
+    # HERMES_SESSION_PLATFORM, while the CLI, TUI and desktop bind
+    # HERMES_SESSION_SOURCE ("cli"/"tui"/"desktop") and leave the platform
+    # EMPTY. A desktop check against HERMES_SESSION_PLATFORM therefore never
+    # fires in production, however green its unit tests are.
+    #
+    # Not HERMES_DESKTOP either: that marks a backend SPAWNED by the app,
+    # which is not the claim we need. The same serve process also answers
+    # `hermes --tui` in the embedded terminal pane, and a tui session must not
+    # inherit the desktop's card.
+    try:
+        from gateway.session_context import get_session_env
+
+        source = (get_session_env("HERMES_SESSION_SOURCE", "") or "").lower()
+        platform = (get_session_env("HERMES_SESSION_PLATFORM", "") or "").lower()
+    except Exception:
+        source = (os.environ.get("HERMES_SESSION_SOURCE", "") or "").lower()
+        platform = (os.environ.get("HERMES_SESSION_PLATFORM", "") or "").lower()
+
+    if source.strip() != "desktop":
+        return "", None
+    # Defensive: if a messaging platform is somehow bound alongside a desktop
+    # source, that session has a chat channel behind it and keeps /approve.
+    if platform.strip() not in ("", "desktop", "local"):
+        return "", None
+
+    session_key = get_current_session_key("") or ""
+    if not session_key:
+        return "", None
+    with _lock:
+        notify_cb = _gateway_notify_cbs.get(session_key)
+    return session_key, notify_cb
+
+
 def send_draft(
     draft_id: str = "",
     approval_token: str = "",
@@ -562,6 +755,90 @@ def send_draft(
             subject_id=draft_id,
             session_id=effective_session,
         ) or ""
+
+    # ── Structural approval (desktop only) ────────────────────────────────
+    # The desktop has no /approve: the renderer refuses the command
+    # client-side (desktop-slash-commands.ts:303) and tui_gateway never
+    # imports agent.approval_tokens, so no KIND_DRAFT token can exist on this
+    # surface. Use the consent channel the surface DOES have — the same queue
+    # and card the dangerous-command guard uses (tools/approval.py:3838).
+    #
+    # Raised from send_draft, never present_draft: this BLOCKS the agent
+    # thread, so the draft must already be rendered and read before the card
+    # can appear. Asking in present_draft would freeze the turn before the
+    # reviewer had anything to review.
+    #
+    # Consent here is a RETURN VALUE on the thread that will do the send, not
+    # a token left lying in a registry — so the cross-process gap that makes
+    # a Telegram /approve unable to authorise a serve-side draft cannot arise.
+    # The mint+consume pair below is a local formality that keeps consume()
+    # the single enforcement point rather than growing a second bypass branch.
+    if not effective_token:
+        session_key, notify_cb = _structural_approval_surface()
+        if notify_cb is not None:
+            # Provenance: refuse to raise a card for a draft this session did
+            # not render. Without this, any draft file readable under
+            # HERMES_HOME — including one written by another process, or by a
+            # session the current reviewer never saw — could be escalated into
+            # a card here.
+            drafted_in = str(draft.get("session_id") or "")
+            if not drafted_in or drafted_in != effective_session:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": (
+                            "not sent — this draft was not presented in this "
+                            "session. Re-present it with present_draft here, "
+                            "then approve the draft this session rendered."
+                        ),
+                        "draft_id": draft_id,
+                        "note": (
+                            "Do not retry. A draft file being readable is not "
+                            "evidence that the reviewer saw it."
+                        ),
+                    }
+                )
+
+            from tools.approval import _await_gateway_decision
+
+            decision = _await_gateway_decision(
+                session_key,
+                notify_cb,
+                {
+                    "command": f"send_email {draft_id}",
+                    "description": _draft_card_description(draft),
+                    "pattern_key": f"send_draft:{draft_id}",
+                    "pattern_keys": [f"send_draft:{draft_id}"],
+                    # Consent is PER DRAFT and single-use. A persisted pattern
+                    # ("always allow send_email") would be a standing
+                    # permission to mail anyone, which is precisely what the
+                    # token design refuses to offer. The card computes its
+                    # button set from these two flags, so False/False renders
+                    # Run/Reject only — no "always allow", no "this session".
+                    "allow_permanent": False,
+                    "allow_session": False,
+                },
+                surface="draft",
+            )
+            if decision.get("choice") != "once":
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": (
+                            "not sent — approval was declined, timed out, or "
+                            "the prompt could not be delivered"
+                        ),
+                        "draft_id": draft_id,
+                        "note": (
+                            "Do not re-raise the prompt. Ask the user and stop."
+                        ),
+                    }
+                )
+            effective_token = get_registry().mint(
+                kind=KIND_DRAFT,
+                subject_id=draft_id,
+                session_id=effective_session,
+            ).token
 
     ok, reason = get_registry().consume(
         token=effective_token,
@@ -724,6 +1001,15 @@ registry.register(
         "parameters": {
             "type": "object",
             "properties": {
+                "from": {
+                    "type": "string",
+                    "description": (
+                        "Full sending address, e.g. 'you@example.com'. REQUIRED "
+                        "on desktop sessions and never inferred: state the "
+                        "identity explicitly, and if the correct mailbox is "
+                        "ambiguous ask the user instead of guessing."
+                    ),
+                },
                 "to": {"type": "string", "description": "Full recipient address."},
                 "subject": {"type": "string"},
                 "body": {"type": "string", "description": "Body text only, no headers."},
@@ -749,6 +1035,10 @@ registry.register(
         body=args.get("body", ""),
         cc=args.get("cc", ""),
         attachments=args.get("attachments") or [],
+        # Stamped into the record so send_draft's structural path can refuse a
+        # draft this session did not render. Not a model-supplied field.
+        session_id=kw.get("session_id", "") or "",
         task_id=kw.get("task_id"),
+        **{"from": args.get("from", "")},
     ),
 )
