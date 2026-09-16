@@ -579,18 +579,31 @@ def _structural_approval_surface() -> tuple[str, Any]:
         logger.debug("approval module unavailable for structural path", exc_info=True)
         return "", None
 
-    # Platform, not process env: HERMES_DESKTOP=1 marks a backend SPAWNED by
-    # the app, which is not the same claim as "this session's client is the
-    # desktop GUI". The same serve process also serves `hermes --tui` in the
-    # embedded terminal pane. The session contextvar is the per-session answer.
+    # Read the SOURCE, not the platform. gateway/session_context.py:419-424:
+    # the gateway binds a platform value ("telegram") to
+    # HERMES_SESSION_PLATFORM, while the CLI, TUI and desktop bind
+    # HERMES_SESSION_SOURCE ("cli"/"tui"/"desktop") and leave the platform
+    # EMPTY. A desktop check against HERMES_SESSION_PLATFORM therefore never
+    # fires in production, however green its unit tests are.
+    #
+    # Not HERMES_DESKTOP either: that marks a backend SPAWNED by the app,
+    # which is not the claim we need. The same serve process also answers
+    # `hermes --tui` in the embedded terminal pane, and a tui session must not
+    # inherit the desktop's card.
     try:
         from gateway.session_context import get_session_env
 
+        source = (get_session_env("HERMES_SESSION_SOURCE", "") or "").lower()
         platform = (get_session_env("HERMES_SESSION_PLATFORM", "") or "").lower()
     except Exception:
+        source = (os.environ.get("HERMES_SESSION_SOURCE", "") or "").lower()
         platform = (os.environ.get("HERMES_SESSION_PLATFORM", "") or "").lower()
 
-    if platform != "desktop":
+    if source.strip() != "desktop":
+        return "", None
+    # Defensive: if a messaging platform is somehow bound alongside a desktop
+    # source, that session has a chat channel behind it and keeps /approve.
+    if platform.strip() not in ("", "desktop", "local"):
         return "", None
 
     session_key = get_current_session_key("") or ""

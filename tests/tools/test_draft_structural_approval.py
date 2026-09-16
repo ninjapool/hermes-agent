@@ -316,28 +316,112 @@ def test_telegram_source_session_fails_closed_and_raises_no_card(
 
     Messaging keeps the /approve <draft_id> contract: it has a working mint
     path already, and a card there would be a second consent channel.
+
+    Binds the session through the REAL production binder rather than setting
+    an env var by name — see test_real_desktop_binding_engages_the_card for
+    why that distinction is load-bearing here.
     """
+    from gateway.session_context import clear_session_vars, set_session_vars
+
     draft_id = _present(tmp_path, session_id="20260916_120000_telegramzz")
+    session_key = "agent:main:telegram:dm:8468018784"
 
     raised: list[dict] = []
     monkeypatch.setattr(
         approval_mod,
         "_gateway_notify_cbs",
-        {"agent:main:telegram:dm:8468018784": lambda payload: raised.append(payload)},
-    )
-    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
-    monkeypatch.setattr(
-        approval_mod, "get_current_session_key",
-        lambda default="default": "agent:main:telegram:dm:8468018784",
+        {session_key: lambda payload: raised.append(payload)},
     )
 
-    out = json.loads(
-        pd.send_draft(draft_id=draft_id, session_id="20260916_120000_telegramzz")
+    tokens = set_session_vars(
+        session_key=session_key,
+        session_id="20260916_120000_telegramzz",
+        platform="telegram",
+        source="telegram",
     )
+    try:
+        out = json.loads(
+            pd.send_draft(draft_id=draft_id, session_id="20260916_120000_telegramzz")
+        )
+    finally:
+        clear_session_vars(tokens)
 
     assert out["success"] is False
     assert "not sent —" in out["error"]
     assert out["needs"] == f"/approve {draft_id}"
+    assert raised == []
+
+
+def test_real_desktop_binding_engages_the_card(tmp_path, monkeypatch,
+                                               _no_cypress_check):
+    """Bind the session the way the SERVE ACTUALLY DOES, then expect a card.
+
+    This test exists because the first implementation gated on
+    HERMES_SESSION_PLATFORM == "desktop" and shipped with fifteen green tests.
+    In production that predicate is never true: the gateway binds a platform
+    value for messaging, while the CLI/TUI/desktop bind HERMES_SESSION_SOURCE
+    and leave the platform EMPTY (gateway/session_context.py:419-424). Every
+    test that set the platform env var by hand agreed with the bug.
+
+    So this one does not name an env var at all. It calls the real
+    set_session_vars with source="desktop" — the same call
+    tui_gateway/server.py:4511 makes — and asserts a card is raised. If the
+    surface predicate drifts away from what the serve binds, this fails.
+    """
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    draft_id = _present(tmp_path, session_id=DESKTOP_SESSION)
+    session_key = "desktop:real-binding"
+
+    notifier = _Notifier("once", session_key=session_key)
+    monkeypatch.setattr(approval_mod, "_gateway_notify_cbs", {session_key: notifier})
+
+    tokens = set_session_vars(
+        session_key=session_key,
+        session_id=DESKTOP_SESSION,
+        source="desktop",
+    )
+    try:
+        out = json.loads(pd.send_draft(draft_id=draft_id, session_id=DESKTOP_SESSION))
+    finally:
+        clear_session_vars(tokens)
+
+    assert len(notifier.payloads) == 1, "no card raised on a real desktop binding"
+    assert out["success"] is True, out
+
+
+def test_real_tui_binding_does_not_engage_the_card(tmp_path, monkeypatch,
+                                                   _no_cypress_check):
+    """The embedded terminal pane shares the serve process but not the card.
+
+    `hermes --tui` binds source="tui" through the same binder. It has no
+    approval card UI, so it must fall through to the token path rather than
+    blocking on a prompt nothing can answer.
+    """
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    draft_id = _present(tmp_path, session_id=DESKTOP_SESSION)
+    session_key = "tui:real-binding"
+
+    raised: list[dict] = []
+    monkeypatch.setattr(
+        approval_mod,
+        "_gateway_notify_cbs",
+        {session_key: lambda payload: raised.append(payload)},
+    )
+
+    tokens = set_session_vars(
+        session_key=session_key,
+        session_id=DESKTOP_SESSION,
+        source="tui",
+    )
+    try:
+        out = json.loads(pd.send_draft(draft_id=draft_id, session_id=DESKTOP_SESSION))
+    finally:
+        clear_session_vars(tokens)
+
+    assert out["success"] is False
+    assert "not sent —" in out["error"]
     assert raised == []
 
 
@@ -346,7 +430,7 @@ def test_no_notify_cb_registered_falls_through_to_the_token_path(
 ):
     """Cron/headless desktop: no card is reachable, so fail closed."""
     draft_id = _present(tmp_path, session_id=DESKTOP_SESSION)
-    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "desktop")
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "desktop")
     monkeypatch.setattr(approval_mod, "_gateway_notify_cbs", {})
 
     out = json.loads(pd.send_draft(draft_id=draft_id, session_id=DESKTOP_SESSION))
