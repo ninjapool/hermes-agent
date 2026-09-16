@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import subprocess
 import time
 import uuid
@@ -81,6 +82,24 @@ def filenames_mentioned_in_text(body: str) -> List[str]:
     return list(seen)
 
 
+def _staged_attachment_location(local_path: Path, sha256: str) -> tuple[str, str]:
+    """Return ``(remote_dir, remote_name)`` for an attachment staged on cypress.
+
+    The filename is left CLEAN. The old scheme prefixed it with the first 8
+    hex of the digest (``d34d294f_invoice.pdf``) to keep two same-named files
+    from colliding in one flat staging directory — and that prefix rode all
+    the way out to the recipient, because the transport passes the staged
+    basename to the MIME part. The reviewer approved ``invoice.pdf`` and the
+    client received ``d34d294f_invoice.pdf``.
+
+    The collision safety was real, so it is kept: the hash moves into a
+    DIRECTORY component. Two files named ``invoice.pdf`` with different
+    content stage to different directories and keep their own names; the same
+    file staged twice lands on the same path, which is idempotent and correct.
+    """
+    return f"~/.hermes-attachments/{sha256[:8]}", local_path.name
+
+
 def _publish_attachment_to_cypress(local_path: str) -> tuple[Optional[str], Optional[str]]:
     """Publish an attachment to the cypress remote host for send-time retrieval.
     
@@ -127,14 +146,20 @@ def _publish_attachment_to_cypress(local_path: str) -> tuple[Optional[str], Opti
     
     # Publish to cypress via scp
     # Use the secure staging directory under SSH user's home
-    remote_dir = "~/.hermes-attachments"
-    remote_name = f"{sha256[:8]}_{local_path_obj.name}"
+    remote_dir, remote_name = _staged_attachment_location(local_path_obj, sha256)
     remote_path = f"{remote_dir}/{remote_name}"
     
     try:
-        # Create remote directory with secure mode (0700)
+        # Create remote directory with secure mode (0700). Both levels: the
+        # per-hash subdir AND its parent, or the parent lands on the default
+        # umask and the 0700 guarantee is only true of the leaf.
+        parent_dir = remote_dir.rsplit("/", 1)[0]
         subprocess.run(
-            ["ssh", "cypress", f"mkdir -p -m 0700 {remote_dir}"],
+            [
+                "ssh",
+                "cypress",
+                f"mkdir -p -m 0700 {parent_dir} && mkdir -p -m 0700 {remote_dir}",
+            ],
             check=True,
             capture_output=True,
             timeout=_ssh_timeout,
@@ -150,7 +175,7 @@ def _publish_attachment_to_cypress(local_path: str) -> tuple[Optional[str], Opti
         
         # Verify by hash on remote
         result = subprocess.run(
-            ["ssh", "cypress", f"sha256sum {remote_path}"],
+            ["ssh", "cypress", f"sha256sum {shlex.quote(remote_path)}"],
             check=True,
             capture_output=True,
             text=True,
@@ -261,19 +286,40 @@ def _resolve_attachments(
     return resolved, errors
 
 
+def _session_source() -> str:
+    """The current session's SOURCE, read the way production binds it.
+
+    Same rule as ``_structural_approval_surface``: read
+    ``HERMES_SESSION_SOURCE`` through ``get_session_env``, never the process
+    env directly and never ``HERMES_DESKTOP`` — one serve process answers many
+    sessions, and the platform var is empty on desktop/CLI/TUI
+    (gateway/session_context.py:419-424).
+    """
+    try:
+        from gateway.session_context import get_session_env
+
+        return (get_session_env("HERMES_SESSION_SOURCE", "") or "").strip().lower()
+    except Exception:
+        return (os.environ.get("HERMES_SESSION_SOURCE", "") or "").strip().lower()
+
+
 def _render(
     to: str,
     subject: str,
     body: str,
     cc: Optional[str],
     resolved: List[Dict[str, Any]],
+    from_addr: str = "",
 ) -> str:
     """Render the reviewable draft, attachment lines included.
 
     The model does not write these lines and cannot omit one: they are
     generated from the same list that will be sent.
     """
-    lines = [f"**To:** {to}"]
+    lines = []
+    if from_addr:
+        lines.append(f"**From:** {from_addr}")
+    lines.append(f"**To:** {to}")
     if cc:
         lines.append(f"**Cc:** {cc}")
     lines.append(f"**Subject:** {subject}")
@@ -299,13 +345,43 @@ def present_draft(
     attachments: Optional[List[str]] = None,
     session_id: str = "",
     task_id: Optional[str] = None,
+    **kwargs: Any,
 ) -> str:
     attachments = attachments or []
+    # ``from`` is a Python keyword, so it can only arrive via **kwargs.
+    from_addr = str(kwargs.get("from", "") or "").strip()
 
     missing = [n for n, v in (("to", to), ("subject", subject), ("body", body)) if not v]
     if missing:
         return json.dumps(
             {"success": False, "error": f"missing required field(s): {', '.join(missing)}"},
+            ensure_ascii=False,
+        )
+
+    # The sending identity is REQUIRED on desktop sessions and is never
+    # inferred. A default-account setting, an env var, or "the account we used
+    # last time" are all guesses, and the reviewer cannot check a guess they
+    # were never shown: the From address decides which thread the reply lands
+    # in and whether the recipient recognises the sender. Sending from the
+    # wrong identity cannot be undone, so the tool refuses rather than picks.
+    #
+    # Scoped to desktop because that is the surface with the approval card —
+    # the card is where the address gets reviewed. Messaging surfaces keep the
+    # prior contract unchanged.
+    if _session_source() == "desktop" and not from_addr:
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    "missing required field: from. The sending identity is "
+                    "never inferred — pass the full From address explicitly."
+                ),
+                "hint": (
+                    "Pass from='<full address>'. Verify it from a real Sent "
+                    "header rather than from an account nickname; if the "
+                    "correct mailbox is ambiguous, ask before drafting."
+                ),
+            },
             ensure_ascii=False,
         )
 
@@ -354,6 +430,7 @@ def present_draft(
         # this serve wrote), so the file's existence is not evidence that the
         # reviewer on THIS surface ever saw it.
         "session_id": session_id or "",
+        "from": from_addr,
         "to": to,
         "cc": cc,
         "subject": subject,
@@ -376,7 +453,7 @@ def present_draft(
             "success": True,
             "draft_id": draft_id,
             "attachment_count": len(resolved),
-            "rendered": _render(to, subject, body, cc, resolved),
+            "rendered": _render(to, subject, body, cc, resolved, from_addr),
             "note": (
                 "Post 'rendered' VERBATIM as your reply — the MEDIA: lines are "
                 "what make the files openable. Do not add, remove or reword an "
@@ -528,8 +605,12 @@ def _draft_card_description(draft: Dict[str, Any]) -> str:
 
     lines = [
         f"draft_id: {draft.get('draft_id', '')}",
-        f"To: {draft.get('to', '')}",
     ]
+    # The sending identity leads the card: it is the field a misdirected send
+    # gets wrong in the way that cannot be retracted.
+    if draft.get("from"):
+        lines.append(f"From: {draft.get('from')}")
+    lines.append(f"To: {draft.get('to', '')}")
     if draft.get("cc"):
         lines.append(f"Cc: {draft.get('cc')}")
     lines.append(f"Subject: {draft.get('subject', '')}")
@@ -920,6 +1001,15 @@ registry.register(
         "parameters": {
             "type": "object",
             "properties": {
+                "from": {
+                    "type": "string",
+                    "description": (
+                        "Full sending address, e.g. 'you@example.com'. REQUIRED "
+                        "on desktop sessions and never inferred: state the "
+                        "identity explicitly, and if the correct mailbox is "
+                        "ambiguous ask the user instead of guessing."
+                    ),
+                },
                 "to": {"type": "string", "description": "Full recipient address."},
                 "subject": {"type": "string"},
                 "body": {"type": "string", "description": "Body text only, no headers."},
@@ -949,5 +1039,6 @@ registry.register(
         # draft this session did not render. Not a model-supplied field.
         session_id=kw.get("session_id", "") or "",
         task_id=kw.get("task_id"),
+        **{"from": args.get("from", "")},
     ),
 )
