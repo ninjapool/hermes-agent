@@ -1782,3 +1782,40 @@ test('windowsHide defaults to true on Windows, is left alone elsewhere', () => {
 If the logic lives inline in a god-file (`main.ts`, `cli.py`,
 `gateway/run.py`) and extracting it feels disruptive: that's the actual
 signal to do the extraction, not to regex around it.
+
+---
+
+## Reporting a code change: five blocks, or it is not done
+
+Any report of a code change — to the user, in a PR body, in a commit
+message, in a subagent's summary back to its parent — consists of **five
+pasted blocks**. Pasted means the tool's own output, verbatim. A sentence
+describing what the output said is not the output; that substitution is the
+entire failure this rule exists to stop.
+
+1. **RED** — the new test failing, before the fix exists. Paste the failure.
+   It must be the RIGHT failure (`AssertionError`, or `NameError` /
+   `ImportError` / `AttributeError` because the thing genuinely does not
+   exist yet). A collection error, a typo, or a fixture crash is not RED.
+2. **GREEN** — the same test passing after the change. Paste it.
+3. **SUITE** — the full suite on the head that will actually be deployed,
+   not on the feature branch in isolation. Paste the summary line. Pre-existing
+   failures are named as pre-existing, with the count on the base commit, or
+   they are treated as yours.
+4. **LIVE** — one end-to-end exercise of the changed path **after the
+   daemon has been restarted onto the new code**, with the output pasted.
+   A green suite is a claim about the repository; LIVE is the only evidence
+   about the running system. Before claiming LIVE, `git log -1` the deployed
+   tree and confirm the process start time is AFTER that commit — otherwise
+   the exercise ran on the old code and proves the opposite of what it claims.
+5. **REVIEW** — an independent reviewer's JSON verdict (see the
+   `requesting-code-review` skill). The agent that wrote the code does not
+   review it.
+
+**A report missing any block is not done.** Not "done pending verification",
+not "done, LIVE to follow" — not done. Say which block is missing and stop
+there; an honest blocker outranks a confident summary every time.
+
+If a block genuinely cannot be produced (no restart window for LIVE, no
+reviewer available for REVIEW), that is a stop-and-report, not a silent
+omission and not a substitution of prose for output.
