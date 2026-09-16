@@ -297,6 +297,7 @@ def present_draft(
     body: str = "",
     cc: str = "",
     attachments: Optional[List[str]] = None,
+    session_id: str = "",
     task_id: Optional[str] = None,
 ) -> str:
     attachments = attachments or []
@@ -347,6 +348,12 @@ def present_draft(
     record = {
         "draft_id": draft_id,
         "created_at": time.time(),
+        # Provenance. The structural-approval path refuses to raise a card for
+        # a draft this session did not render: a draft file is visible to every
+        # process sharing HERMES_HOME (the Telegram gateway can read a draft
+        # this serve wrote), so the file's existence is not evidence that the
+        # reviewer on THIS surface ever saw it.
+        "session_id": session_id or "",
         "to": to,
         "cc": cc,
         "subject": subject,
@@ -502,6 +509,98 @@ def cleanup_cypress_attachments(draft_id: str) -> dict:
     return {"draft_id": draft_id, "removed": removed, "failed": failed}
 
 
+def _draft_card_description(draft: Dict[str, Any]) -> str:
+    """Build the approval card's text from the draft RECORD alone.
+
+    Every character comes from persisted fields or from os.stat/hashlib; no
+    model-supplied string reaches the card except the recipient/subject values
+    that ARE the thing being approved (and which the reviewer already read in
+    the rendered draft). The body is deliberately NOT included: it is long,
+    model-authored prose, and the card must describe the ENVELOPE — who
+    receives what — which is the part a misdirected send gets wrong.
+
+    Attachment bytes and SHA-256 are recomputed from disk here rather than read
+    back from the record. A stale hash would describe the file as it was at
+    render time, and the whole point of the card is to describe what is about
+    to leave the machine.
+    """
+    import hashlib
+
+    lines = [
+        f"draft_id: {draft.get('draft_id', '')}",
+        f"To: {draft.get('to', '')}",
+    ]
+    if draft.get("cc"):
+        lines.append(f"Cc: {draft.get('cc')}")
+    lines.append(f"Subject: {draft.get('subject', '')}")
+
+    attachments = draft.get("attachments") or []
+    if not attachments:
+        lines.append("Attachments: none")
+    for i, att in enumerate(attachments, 1):
+        path = Path(str(att.get("path", "")))
+        name = path.name or "?"
+        try:
+            content = path.read_bytes()
+            size = len(content)
+            digest = hashlib.sha256(content).hexdigest()
+        except OSError:
+            # Unreadable now: say so on the card. The send-time re-verification
+            # below will refuse anyway, but the reviewer should not be asked to
+            # approve a file the machine cannot read.
+            lines.append(f"Attachment {i}/{len(attachments)}: {name} — UNREADABLE")
+            continue
+        lines.append(
+            f"Attachment {i}/{len(attachments)}: {name} — {size:,} bytes — "
+            f"sha256:{digest}"
+        )
+    return "\n".join(lines)
+
+
+def _structural_approval_surface() -> tuple[str, Any]:
+    """Return ``(session_key, notify_cb)`` when this surface can raise a card.
+
+    Scoped to desktop sessions. Messaging platforms keep the ``/approve
+    <draft_id>`` contract unchanged: they already have a working mint path
+    (gateway/run.py:8181), the token they mint is bound to the same process
+    that will spend it, and a card there would be a second, redundant consent
+    channel on a surface that does not need one.
+
+    Returns ``("", None)`` for every other surface, which leaves send_draft on
+    the token path and therefore fails closed.
+    """
+    try:
+        from tools.approval import (
+            _gateway_notify_cbs,
+            _lock,
+            get_current_session_key,
+        )
+    except Exception:  # pragma: no cover - approval module always importable
+        logger.debug("approval module unavailable for structural path", exc_info=True)
+        return "", None
+
+    # Platform, not process env: HERMES_DESKTOP=1 marks a backend SPAWNED by
+    # the app, which is not the same claim as "this session's client is the
+    # desktop GUI". The same serve process also serves `hermes --tui` in the
+    # embedded terminal pane. The session contextvar is the per-session answer.
+    try:
+        from gateway.session_context import get_session_env
+
+        platform = (get_session_env("HERMES_SESSION_PLATFORM", "") or "").lower()
+    except Exception:
+        platform = (os.environ.get("HERMES_SESSION_PLATFORM", "") or "").lower()
+
+    if platform != "desktop":
+        return "", None
+
+    session_key = get_current_session_key("") or ""
+    if not session_key:
+        return "", None
+    with _lock:
+        notify_cb = _gateway_notify_cbs.get(session_key)
+    return session_key, notify_cb
+
+
 def send_draft(
     draft_id: str = "",
     approval_token: str = "",
@@ -562,6 +661,90 @@ def send_draft(
             subject_id=draft_id,
             session_id=effective_session,
         ) or ""
+
+    # ── Structural approval (desktop only) ────────────────────────────────
+    # The desktop has no /approve: the renderer refuses the command
+    # client-side (desktop-slash-commands.ts:303) and tui_gateway never
+    # imports agent.approval_tokens, so no KIND_DRAFT token can exist on this
+    # surface. Use the consent channel the surface DOES have — the same queue
+    # and card the dangerous-command guard uses (tools/approval.py:3838).
+    #
+    # Raised from send_draft, never present_draft: this BLOCKS the agent
+    # thread, so the draft must already be rendered and read before the card
+    # can appear. Asking in present_draft would freeze the turn before the
+    # reviewer had anything to review.
+    #
+    # Consent here is a RETURN VALUE on the thread that will do the send, not
+    # a token left lying in a registry — so the cross-process gap that makes
+    # a Telegram /approve unable to authorise a serve-side draft cannot arise.
+    # The mint+consume pair below is a local formality that keeps consume()
+    # the single enforcement point rather than growing a second bypass branch.
+    if not effective_token:
+        session_key, notify_cb = _structural_approval_surface()
+        if notify_cb is not None:
+            # Provenance: refuse to raise a card for a draft this session did
+            # not render. Without this, any draft file readable under
+            # HERMES_HOME — including one written by another process, or by a
+            # session the current reviewer never saw — could be escalated into
+            # a card here.
+            drafted_in = str(draft.get("session_id") or "")
+            if not drafted_in or drafted_in != effective_session:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": (
+                            "not sent — this draft was not presented in this "
+                            "session. Re-present it with present_draft here, "
+                            "then approve the draft this session rendered."
+                        ),
+                        "draft_id": draft_id,
+                        "note": (
+                            "Do not retry. A draft file being readable is not "
+                            "evidence that the reviewer saw it."
+                        ),
+                    }
+                )
+
+            from tools.approval import _await_gateway_decision
+
+            decision = _await_gateway_decision(
+                session_key,
+                notify_cb,
+                {
+                    "command": f"send_email {draft_id}",
+                    "description": _draft_card_description(draft),
+                    "pattern_key": f"send_draft:{draft_id}",
+                    "pattern_keys": [f"send_draft:{draft_id}"],
+                    # Consent is PER DRAFT and single-use. A persisted pattern
+                    # ("always allow send_email") would be a standing
+                    # permission to mail anyone, which is precisely what the
+                    # token design refuses to offer. The card computes its
+                    # button set from these two flags, so False/False renders
+                    # Run/Reject only — no "always allow", no "this session".
+                    "allow_permanent": False,
+                    "allow_session": False,
+                },
+                surface="draft",
+            )
+            if decision.get("choice") != "once":
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": (
+                            "not sent — approval was declined, timed out, or "
+                            "the prompt could not be delivered"
+                        ),
+                        "draft_id": draft_id,
+                        "note": (
+                            "Do not re-raise the prompt. Ask the user and stop."
+                        ),
+                    }
+                )
+            effective_token = get_registry().mint(
+                kind=KIND_DRAFT,
+                subject_id=draft_id,
+                session_id=effective_session,
+            ).token
 
     ok, reason = get_registry().consume(
         token=effective_token,
@@ -749,6 +932,9 @@ registry.register(
         body=args.get("body", ""),
         cc=args.get("cc", ""),
         attachments=args.get("attachments") or [],
+        # Stamped into the record so send_draft's structural path can refuse a
+        # draft this session did not render. Not a model-supplied field.
+        session_id=kw.get("session_id", "") or "",
         task_id=kw.get("task_id"),
     ),
 )
