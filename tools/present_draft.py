@@ -82,6 +82,75 @@ def filenames_mentioned_in_text(body: str) -> List[str]:
     return list(seen)
 
 
+# Absolute, because a remote path that needs shell expansion cannot also be
+# safely quoted — and quoting is not optional on a path built from a filename.
+#
+# The 2026-09-17 failure: this root was "~/.hermes-attachments" and the verify
+# step passed the resulting path through shlex.quote(). The remote shell got a
+# literal tilde, sha256sum could not find a file that scp had just copied
+# there successfully, and EVERY draft with an attachment was refused with an
+# error claiming the attachment "will not be sendable" when it was present and
+# byte-correct. mkdir and scp interpolated unquoted, so they worked — the
+# sequence was "create it, copy it, then fail to find it".
+#
+# Fixing the quoting alone would have left the same trap for the next caller.
+# The tilde is gone instead: no remote command contains one, so every remote
+# path argument can be quoted unconditionally.
+#
+# This is the home directory of the SSH user (ds) on cypress. The hermes-send
+# transport runs as a different user and reads these files at send time.
+CYPRESS_STAGING_ROOT = "/home/ds/.hermes-attachments"
+
+# A staged basename is interpolated into a remote shell command. Every use is
+# shlex.quote()d, which makes brackets, parentheses and spaces harmless — so
+# those stay ALLOWED: "見積 (Rev.1).pdf" is an ordinary client filename here.
+# What is rejected is what stays dangerous or ambiguous even when quoted, or
+# what would corrupt the MIME part the recipient receives: quotes and
+# backslashes (which break quoting itself), $ and backtick (substitution if a
+# future caller ever interpolates unquoted), the redirection/pipe/background
+# metacharacters, and control characters.
+_UNSAFE_BASENAME_CHARS = set("$`\"'\\;|&<>\n\r\t")
+
+
+class StagingError(Exception):
+    """An attachment could not be staged on cypress.
+
+    ``kind`` distinguishes the three failures that used to share one message:
+
+    - ``transfer_failed``  — scp/ssh could not complete the copy.
+    - ``remote_not_found`` — the copy reported success, nothing is there.
+    - ``hash_mismatch``    — a file is there and its bytes are wrong.
+
+    They imply completely different recovery, and the old collapsed error was
+    actively misleading: it said the attachment "will not be sendable" in a
+    case where the file was present and byte-correct.
+    """
+
+    def __init__(self, kind: str, message: str):
+        super().__init__(message)
+        self.kind = kind
+        self.message = message
+
+
+def basename_is_safe_to_stage(name: str) -> bool:
+    """True if ``name`` may be interpolated into a remote command.
+
+    Rejects shell metacharacters, quotes, ``$``, backticks and control
+    characters. Spaces and non-ASCII (Japanese filenames are routine here)
+    are fine.
+    """
+    if not name or name in (".", ".."):
+        return False
+    if "/" in name:
+        return False
+    for ch in name:
+        if ch in _UNSAFE_BASENAME_CHARS:
+            return False
+        if ord(ch) < 0x20 or ord(ch) == 0x7F:
+            return False
+    return True
+
+
 def _staged_attachment_location(local_path: Path, sha256: str) -> tuple[str, str]:
     """Return ``(remote_dir, remote_name)`` for an attachment staged on cypress.
 
@@ -96,30 +165,62 @@ def _staged_attachment_location(local_path: Path, sha256: str) -> tuple[str, str
     DIRECTORY component. Two files named ``invoice.pdf`` with different
     content stage to different directories and keep their own names; the same
     file staged twice lands on the same path, which is idempotent and correct.
+
+    The returned directory is ABSOLUTE — see CYPRESS_STAGING_ROOT.
     """
-    return f"~/.hermes-attachments/{sha256[:8]}", local_path.name
+    return f"{CYPRESS_STAGING_ROOT}/{sha256[:8]}", local_path.name
 
 
-def _publish_attachment_to_cypress(local_path: str) -> tuple[Optional[str], Optional[str]]:
+def _remote_sha256(remote_path: str, timeout: int) -> Optional[str]:
+    """Return the sha256 of ``remote_path`` on cypress, or None if absent.
+
+    A non-zero exit means "not there" — the caller decides whether that is a
+    cache miss (before transfer) or a hard failure (after one). Every path
+    argument is quoted; nothing here relies on shell expansion.
+    """
+    import subprocess
+
+    result = subprocess.run(
+        ["ssh", "cypress", f"sha256sum {shlex.quote(remote_path)}"],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if getattr(result, "returncode", 1) != 0:
+        return None
+    out = (result.stdout or "").split()
+    return out[0] if out else None
+
+
+def _publish_attachment_to_cypress(
+    local_path: str, *, raise_on_error: bool = False
+) -> tuple[Optional[str], Optional[str]]:
     """Publish an attachment to the cypress remote host for send-time retrieval.
-    
+
     The hermes-send transport reads attachments from cypress's local disk via
     /run/hermes-mailsend/sock. This function copies the file there and verifies
     it by content hash.
-    
-    Attachments are staged to ~/.hermes-attachments on cypress (the home directory
-    of the account running the ssh connection, typically the deploy user ds).
-    This directory is created with mode 0700 to ensure client invoices
-    (containing customer commercial figures) are not world-readable.
-    
+
+    Attachments are staged under CYPRESS_STAGING_ROOT (an ABSOLUTE path — see
+    the constant for why a tilde here caused the 2026-09-17 outage). The
+    directory is created 0700: client estimates carry commercial figures and
+    the host is shared.
+
+    Order of operations is verify-FIRST. The staging path is content-addressed,
+    so if a file with the right hash is already there the transfer is a no-op
+    and both the mkdir and the scp are skipped. Re-presenting the same draft
+    costs one probe instead of a full re-upload.
+
     NOTE (2026-09-14): While the hermes-send transport runs as user mailsend
     (uid=976), we create the staging directory under the SSH user's home (~ds)
     because we lack passwordless sudo to create it as mailsend. The transport
     validates that it can read from the paths hermes-send provides, so file
-    ownership is not a blocker. The security property (0700 mode, not world-readable)
-    is preserved.
-    
+    ownership is not a blocker. The security property (0700 mode, not
+    world-readable) is preserved.
+
     Returns (cypress_path, sha256_hex) on success, (None, None) on failure.
+    With ``raise_on_error=True`` a failure raises StagingError instead, whose
+    ``kind`` names which of the three distinct failures occurred.
     """
     import hashlib
     import subprocess
@@ -132,86 +233,99 @@ def _publish_attachment_to_cypress(local_path: str) -> tuple[Optional[str], Opti
     _ssh_timeout = int(os.environ.get("HERMES_DRAFT_SSH_TIMEOUT", "30"))
     _scp_timeout = int(os.environ.get("HERMES_DRAFT_SCP_TIMEOUT", "120"))
 
+    def _fail(kind: str, message: str) -> tuple[None, None]:
+        logger.warning("Staging %s failed (%s): %s", local_path, kind, message)
+        if raise_on_error:
+            raise StagingError(kind, message)
+        return None, None
+
     local_path_obj = Path(local_path)
     if not local_path_obj.is_file():
-        return None, None
-    
-    # Read and hash the source
+        return _fail("transfer_failed", f"{local_path}: not a regular file")
+
+    if not basename_is_safe_to_stage(local_path_obj.name):
+        return _fail(
+            "unsafe_name",
+            f"{local_path_obj.name!r}: filename contains unsafe characters "
+            "(shell metacharacters, quotes, $, backtick or control characters)",
+        )
+
     try:
         content = local_path_obj.read_bytes()
         sha256 = hashlib.sha256(content).hexdigest()
     except OSError as e:
-        logger.warning("Failed to read source file %s: %s", local_path, e)
-        return None, None
-    
-    # Publish to cypress via scp
-    # Use the secure staging directory under SSH user's home
+        return _fail("transfer_failed", f"cannot read source file {local_path}: {e}")
+
     remote_dir, remote_name = _staged_attachment_location(local_path_obj, sha256)
     remote_path = f"{remote_dir}/{remote_name}"
-    
+
     try:
-        # Create remote directory with secure mode (0700). Both levels: the
-        # per-hash subdir AND its parent, or the parent lands on the default
-        # umask and the 0700 guarantee is only true of the leaf.
-        parent_dir = remote_dir.rsplit("/", 1)[0]
-        subprocess.run(
-            [
-                "ssh",
-                "cypress",
-                f"mkdir -p -m 0700 {parent_dir} && mkdir -p -m 0700 {remote_dir}",
-            ],
-            check=True,
-            capture_output=True,
-            timeout=_ssh_timeout,
-        )
-        
-        # Copy file
-        subprocess.run(
-            ["scp", local_path, f"cypress:{remote_path}"],
-            check=True,
-            capture_output=True,
-            timeout=_scp_timeout,
-        )
-        
-        # Verify by hash on remote
-        result = subprocess.run(
-            ["ssh", "cypress", f"sha256sum {shlex.quote(remote_path)}"],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=_ssh_timeout,
-        )
-        remote_sha256 = result.stdout.split()[0]
-        
-        if remote_sha256 != sha256:
-            logger.error(
-                "Hash mismatch for %s: local=%s remote=%s",
-                local_path, sha256, remote_sha256
+        # --- verify first -------------------------------------------------
+        # Content-addressed path: a hash match means the right bytes are
+        # already staged and there is nothing to do.
+        already = _remote_sha256(remote_path, _ssh_timeout)
+        if already == sha256:
+            logger.info(
+                "Attachment already staged %s -> %s (sha256=%s)",
+                local_path, remote_path, sha256,
             )
-            return None, None
-        
-        # Expand the remote path for logging and storage (convert ~)
-        result_path = subprocess.run(
-            ["ssh", "cypress", f"echo {remote_path}"],
-            capture_output=True,
-            text=True,
-            timeout=_ssh_timeout,
-            check=True,
-        )
-        expanded_path = result_path.stdout.strip()
-        
+            return remote_path, sha256
+
+        # --- transfer -----------------------------------------------------
+        # Create both levels 0700, or the parent lands on the default umask
+        # and the guarantee is only true of the leaf.
+        parent_dir = remote_dir.rsplit("/", 1)[0]
+        try:
+            subprocess.run(
+                [
+                    "ssh",
+                    "cypress",
+                    f"mkdir -p -m 0700 {shlex.quote(parent_dir)} && "
+                    f"mkdir -p -m 0700 {shlex.quote(remote_dir)}",
+                ],
+                check=True,
+                capture_output=True,
+                timeout=_ssh_timeout,
+            )
+            subprocess.run(
+                ["scp", local_path, f"cypress:{shlex.quote(remote_path)}"],
+                check=True,
+                capture_output=True,
+                timeout=_scp_timeout,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
+            return _fail("transfer_failed", f"could not copy to cypress: {e}")
+
+        # --- verify after -------------------------------------------------
+        remote_sha256 = _remote_sha256(remote_path, _ssh_timeout)
+        if remote_sha256 is None:
+            # scp reported success and the file is not there. Distinct from a
+            # transfer error and from wrong bytes: this is the case the old
+            # collapsed message described as "will not be sendable" even when
+            # the file was fine.
+            return _fail(
+                "remote_not_found",
+                f"copy reported success but {remote_path} is not present on cypress",
+            )
+        if remote_sha256 != sha256:
+            return _fail(
+                "hash_mismatch",
+                f"{remote_path}: local={sha256} remote={remote_sha256}",
+            )
+
+        # The path is constructed, not discovered — CYPRESS_STAGING_ROOT is
+        # already absolute, so the old `ssh cypress echo` round trip that
+        # existed purely to expand `~` is gone.
         logger.info(
             "Published attachment %s -> %s (sha256=%s)",
-            local_path, expanded_path, sha256
+            local_path, remote_path, sha256,
         )
-        return expanded_path, sha256
-        
+        return remote_path, sha256
+
+    except StagingError:
+        raise
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
-        logger.warning(
-            "Failed to publish %s to cypress: %s",
-            local_path, e
-        )
-        return None, None
+        return _fail("transfer_failed", f"unexpected staging failure: {e}")
 
 
 def _resolve_attachments(
@@ -255,6 +369,16 @@ def _resolve_attachments(
         if size == 0:
             errors.append(f"{path}: zero bytes — nothing to review")
             continue
+        # Reject a dangerous basename BEFORE any remote command is built. The
+        # staged name is interpolated into a remote shell command and is also
+        # what the recipient sees on the MIME part. Japanese and spaces pass.
+        if not basename_is_safe_to_stage(path.name):
+            errors.append(
+                f"{path}: filename contains unsafe characters "
+                "(shell metacharacters, quotes, $, backtick, or control "
+                "characters). Rename the file and try again."
+            )
+            continue
         
         # Stage to the host the transport actually reads from.
         #
@@ -272,12 +396,33 @@ def _resolve_attachments(
             "bytes": size,
         }
         if os.environ.get("HERMES_DRAFT_SKIP_CYPRESS") != "1":
-            cypress_path, sha256 = _publish_attachment_to_cypress(str(path))
-            if cypress_path is None:
-                errors.append(
-                    f"{path}: failed to publish to cypress "
-                    "(attachment will not be sendable)"
+            try:
+                cypress_path, sha256 = _publish_attachment_to_cypress(
+                    str(path), raise_on_error=True
                 )
+            except StagingError as exc:
+                # Name which of the three failures happened. They imply very
+                # different recovery, and the old collapsed message claimed
+                # the attachment "will not be sendable" in a case where the
+                # file was present and byte-correct.
+                explanation = {
+                    "transfer_failed": (
+                        "could not be copied to cypress (transfer failed)"
+                    ),
+                    "remote_not_found": (
+                        "was copied to cypress but is not present there "
+                        "afterwards (remote file not found)"
+                    ),
+                    "hash_mismatch": (
+                        "is present on cypress with different bytes "
+                        "(hash mismatch) — the staged copy is not this file"
+                    ),
+                    "unsafe_name": "has a filename that cannot be staged safely",
+                }.get(exc.kind, "could not be staged")
+                errors.append(f"{path}: {explanation} [{exc.kind}]: {exc.message}")
+                continue
+            if cypress_path is None:
+                errors.append(f"{path}: could not be staged on cypress")
                 continue
             entry["cypress_path"] = cypress_path  # where hermes-send reads it
             entry["sha256"] = sha256              # verification hash
@@ -569,7 +714,10 @@ def cleanup_cypress_attachments(draft_id: str) -> dict:
             continue  # old-format record, nothing was staged
         try:
             result = subprocess.run(
-                ["ssh", "cypress", "rm", "-f", "--", cypress_path],
+                # ssh joins argv into ONE remote command string, so the path
+                # must be quoted here too — a space in the basename would
+                # otherwise split into two arguments to rm.
+                ["ssh", "cypress", f"rm -f -- {shlex.quote(cypress_path)}"],
                 capture_output=True,
                 text=True,
                 timeout=15,
@@ -881,7 +1029,7 @@ def send_draft(
         if cypress_path:
             try:
                 result = subprocess.run(
-                    ["ssh", "cypress", f"test -f {cypress_path}"],
+                    ["ssh", "cypress", f"test -f {shlex.quote(cypress_path)}"],
                     check=False,
                     capture_output=True,
                     # Generous: a TIMEOUT here would be read as "attachment
