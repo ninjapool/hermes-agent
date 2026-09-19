@@ -22,6 +22,7 @@ and the sent object are the same object.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -390,19 +391,27 @@ def _resolve_attachments(
         # sat nowhere the transport could reach — the exact failure this
         # staging exists to prevent. On any real publish failure we still
         # refuse the whole draft.
+        # Content digest of the LOCAL file, recorded unconditionally.
+        #
+        # Distinct from the "sha256" below, which only exists when the file
+        # was staged to cypress and is a staging-verification value. Send-time
+        # checks (b) and (c) both compare against THIS value, on every path
+        # including HERMES_DRAFT_SKIP_CYPRESS runs.
+        #
+        # If it cannot be computed the draft is refused here rather than
+        # persisted: a record whose digest is absent is a record whose
+        # attachment can never be verified, and writing one would hand
+        # send_draft an unanswerable question.
+        content_digest = _file_digest(path)
+        if content_digest is None:
+            raise StagingError(
+                f"could not read {path} to digest it; the draft was not saved"
+            )
         entry = {
             "path": str(path),           # Review path (local to gateway's client)
             "name": path.name,
             "bytes": size,
-            # Content digest of the LOCAL file, recorded unconditionally.
-            #
-            # Distinct from the "sha256" below, which only exists when the file
-            # was staged to cypress and is a staging-verification value. The
-            # record hash needs a digest that is present on every attachment on
-            # every path — including HERMES_DRAFT_SKIP_CYPRESS runs — or the
-            # stored and recomputed digests disagree for reasons that have
-            # nothing to do with tampering.
-            "content_sha256": _file_digest(path),
+            "content_sha256": content_digest,
         }
         if os.environ.get("HERMES_DRAFT_SKIP_CYPRESS") != "1":
             try:
@@ -456,64 +465,68 @@ def _resolve_attachments(
 # too. What it makes impossible is a SILENT change: to move the recipient you
 # must also move the prefix the reviewer saw.
 
-_HASHED_FIELDS = ("from", "to", "cc", "subject", "body")
+_SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 
 
-def _file_digest(path: Path) -> str:
-    """SHA-256 of a file's bytes, or a sentinel if it cannot be read.
+def _file_digest(path: Path) -> Optional[str]:
+    """SHA-256 of a file's bytes, or None if it cannot be read.
 
-    The sentinel is deliberately a value, not an exception: an attachment that
-    became unreadable is a CHANGE to what would be sent, and it should move the
-    record digest rather than crash the comparison.
+    None means "could not measure", and every caller treats that as a refusal.
+    The previous version returned an "UNREADABLE" sentinel so the value could
+    be folded into a recomputed digest; there is no recomputed digest any
+    more, and a sentinel that flows onward is exactly how an unverifiable
+    attachment gets waved through.
     """
-    import hashlib
-
     try:
         return hashlib.sha256(Path(path).read_bytes()).hexdigest()
     except OSError:
-        return "UNREADABLE"
+        return None
 
 
-def canonical_record_digest(record: Dict[str, Any]) -> str:
-    """SHA-256 over the canonical form of a draft record.
+def _is_sha256(value: Any) -> bool:
+    """True only for a well-formed lowercase hex SHA-256.
 
-    Covers the envelope fields and each attachment's own SHA-256 — so swapping
-    an attachment's CONTENT moves the digest even though the record's text is
-    untouched. Deliberately excludes draft_id, created_at, session_id and the
-    stored hash itself: those are bookkeeping, not the thing being approved,
-    and including them would make the digest impossible to recompute.
-
-    The canonical form is a JSON array with sorted keys and no whitespace
-    variance, so the digest does not depend on how the file happens to be
-    formatted on disk.
+    Everything else — empty, None, whitespace, wrong length, a list, an int —
+    is malformed, and malformed always refuses. A stored digest that cannot be
+    parsed is an attachment whose content cannot be verified, never an
+    attachment that needs no verification.
     """
-    import hashlib
+    return isinstance(value, str) and bool(_SHA256_RE.match(value.strip()))
 
-    payload: List[Any] = [
-        [field, str(record.get(field, "") or "")] for field in _HASHED_FIELDS
-    ]
-    attachments = []
-    for att in record.get("attachments") or []:
-        attachments.append(
-            [
-                str(att.get("path", "") or ""),
-                int(att.get("bytes", 0) or 0),
-                str(att.get("content_sha256", "") or ""),
-                # The filename the recipient sees, and — load-bearing — the
-                # cypress path the transport actually reads the bytes FROM
-                # (_resolve_attachments:436). send_draft only checks that path
-                # still EXISTS, never what is in it, so leaving it unhashed
-                # would let a repointed cypress_path pass both gates and
-                # attach a different file than the one reviewed. The local
-                # content_sha256 does not cover that: it digests the local
-                # copy, not the remote one the send reads.
-                str(att.get("name", "") or ""),
-                str(att.get("cypress_path", "") or ""),
-            ]
-        )
-    payload.append(["attachments", attachments])
-    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+def _seal_path(draft_id: str) -> Path:
+    """Sidecar holding the seal for a draft record file."""
+    return _DRAFT_DIR / f"{draft_id}.seal"
+
+
+def seal_bytes(raw: bytes) -> str:
+    """The seal IS the SHA-256 of the record file's exact bytes.
+
+    No field extraction, no canonicalisation, no recomputation. The previous
+    design digested a *reconstruction* of the record and recomputed some
+    fields from disk while building it; three separate holes came out of that
+    single idea, each one a stored value silently shadowed by a recomputed
+    one. Hashing the literal bytes removes the category: there is nothing to
+    shadow because nothing is rebuilt.
+    """
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _stored_seal(draft_id: str) -> Optional[str]:
+    """The seal written at present time, or None if absent/malformed."""
+    try:
+        raw = _seal_path(draft_id).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return raw if _is_sha256(raw) else None
+
+
+def _live_seal(draft_id: str) -> Optional[str]:
+    """The seal of the record file as it exists right now."""
+    try:
+        return seal_bytes(_draft_path(draft_id).read_bytes())
+    except OSError:
+        return None
 
 
 # --- Verified address book ------------------------------------------------
@@ -611,7 +624,7 @@ def _render(
     cc: Optional[str],
     resolved: List[Dict[str, Any]],
     from_addr: str = "",
-    record_hash: str = "",
+    seal: str = "",
 ) -> str:
     """Render the reviewable draft, attachment lines included.
 
@@ -630,12 +643,12 @@ def _render(
             f"**Attachment {i}/{len(resolved)}:** `{att['path']}` "
             f"· {att['bytes']:,} bytes"
         )
-    # The record prefix is the reviewer's handle on THIS exact envelope. It is
+    # The seal prefix is the reviewer's handle on THIS exact envelope. It is
     # the same 8 characters the approval card will show, so the two can be
     # compared by eye; if they differ, the record moved between render and
     # send and the send will refuse.
-    if record_hash:
-        lines.append(f"**Record:** {record_hash[:8]}")
+    if seal:
+        lines.append(f"**Record:** {seal[:8]}")
     lines += ["", "---", body.strip(), "---"]
     # The MEDIA: lines are what make the files openable in chat. They are the
     # payload of this whole tool; everything above is context for them.
@@ -745,15 +758,17 @@ def present_draft(
         "body": body,
         "attachments": resolved,
     }
-    # Stamped before the record is written so the file on disk always carries
-    # its own digest. send_draft recomputes this from the file and refuses on
-    # any difference.
-    record["record_hash"] = canonical_record_digest(record)
+    # Write once, then seal the bytes that landed. The seal is taken from what
+    # is actually on disk — not from the dict we intended to write — so the
+    # thing verified at send time is the thing the reviewer's render was built
+    # from. The record file is never rewritten after this point; a second write
+    # would open a window between the two.
     try:
         _DRAFT_DIR.mkdir(parents=True, exist_ok=True)
-        _draft_path(draft_id).write_text(
-            json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        raw = json.dumps(record, ensure_ascii=False, indent=2).encode("utf-8")
+        _draft_path(draft_id).write_bytes(raw)
+        seal = seal_bytes(_draft_path(draft_id).read_bytes())
+        _seal_path(draft_id).write_text(seal, encoding="utf-8")
     except OSError as exc:
         return json.dumps(
             {"success": False, "error": f"could not persist draft: {exc}"},
@@ -766,7 +781,7 @@ def present_draft(
             "draft_id": draft_id,
             "attachment_count": len(resolved),
             "rendered": _render(
-                to, subject, body, cc, resolved, from_addr, record["record_hash"]
+                to, subject, body, cc, resolved, from_addr, seal
             ),
             "note": (
                 "Post 'rendered' VERBATIM as your reply — the MEDIA: lines are "
@@ -927,8 +942,9 @@ def _draft_card_description(draft: Dict[str, Any]) -> str:
     # the rest on expand. A verification value the reviewer has to click to see
     # is a verification value that does not get checked.
     head = f"draft_id: {draft.get('draft_id', '')}"
-    if draft.get("record_hash"):
-        head += f" — Record: {str(draft.get('record_hash'))[:8]}"
+    seal = _stored_seal(str(draft.get("draft_id", "") or ""))
+    if seal:
+        head += f" — Record: {seal[:8]}"
     lines = [head]
     # The sending identity leads the card: it is the field a misdirected send
     # gets wrong in the way that cannot be retracted.
@@ -1019,43 +1035,6 @@ def _structural_approval_surface() -> tuple[str, Any]:
     return session_key, notify_cb
 
 
-def _live_record_digest(record: Dict[str, Any]) -> str:
-    """The digest of the record as it stands RIGHT NOW, files included.
-
-    Re-stats and re-hashes every attachment from disk rather than trusting the
-    stored values, so a file swapped between render and send moves the digest
-    even though the JSON was never touched. An unreadable attachment is folded
-    in as a sentinel, which also moves the digest — a file that vanished is a
-    change to what would be sent.
-    """
-    import hashlib
-
-    live = dict(record)
-    attachments = []
-    for att in record.get("attachments") or []:
-        entry = dict(att)
-        path = Path(str(att.get("path", "") or ""))
-        try:
-            content = path.read_bytes()
-            entry["bytes"] = len(content)
-            fresh = hashlib.sha256(content).hexdigest()
-        except OSError:
-            entry["bytes"] = -1
-            fresh = "UNREADABLE"
-        # Fold the STORED digest in alongside the freshly computed one. If we
-        # only kept `fresh`, the stored field would ride free of the hash:
-        # blanking it on disk would leave the digest identical, and the
-        # post-consent remote check reads that same field and skips itself
-        # when it is falsy. One attacker-controlled byte, both defences
-        # silent. Recording the pair means a rewritten stored digest moves
-        # the hash, while a genuinely swapped local file still moves it too.
-        stored = str(att.get("content_sha256", "") or "")
-        entry["content_sha256"] = f"{fresh}|{stored}" if stored != fresh else fresh
-        attachments.append(entry)
-    live["attachments"] = attachments
-    return canonical_record_digest(live)
-
-
 def send_draft(
     draft_id: str = "",
     approval_token: str = "",
@@ -1095,30 +1074,36 @@ def send_draft(
     # Placed FIRST deliberately. Raising a card for a tampered record would
     # ask the human to approve the modified envelope — the card is built from
     # the same file — so the check has to come before anything asks.
-    stored_hash = str(draft.get("record_hash", "") or "")
-    if not stored_hash:
-        # Pre-hash drafts, rendered before this check existed. Refuse rather
-        # than wave through: a missing hash is indistinguishable from one an
-        # attacker stripped, and re-presenting is cheap.
+    # (a) THE RECORD FILE, before consent.
+    #
+    # Compare the seal taken when the file was written against the seal of the
+    # file right now. Both are hashes of literal bytes; neither is rebuilt from
+    # fields, so there is no recomputed value that can shadow a stored one.
+    # That shadowing is what produced three separate holes in the design this
+    # replaces.
+    #
+    # Placed FIRST deliberately. Raising a card for a tampered record would ask
+    # the human to approve the modified envelope — the card is built from the
+    # same file — so the check has to come before anything asks.
+    stored_seal = _stored_seal(draft_id)
+    if stored_seal is None:
         return json.dumps(
             {
                 "success": False,
                 "error": (
-                    "not sent — this draft carries no record hash, so what is "
-                    "on disk cannot be matched against what was reviewed. "
+                    "not sent — this draft has no readable seal, so what is on "
+                    "disk cannot be matched against what was reviewed. "
                     "Re-present it with present_draft and have it approved again."
                 ),
                 "draft_id": draft_id,
             },
             ensure_ascii=False,
         )
-    live_hash = _live_record_digest(draft)
-    if live_hash != stored_hash:
-        # A vanished attachment also moves the digest, but "the file is gone"
-        # and "the envelope was altered" call for different responses, and the
-        # existing existence check (below, at send time) already words the
-        # first one precisely. Diagnose it here so the hash gate does not
-        # swallow the more specific message just by running earlier.
+    live_seal = _live_seal(draft_id)
+    if live_seal != stored_seal:
+        # A vanished attachment is reported by check (b) in words that name the
+        # file. Diagnose it here so the seal gate does not swallow the more
+        # specific message just by running earlier.
         missing = [
             str(att.get("path", ""))
             for att in (draft.get("attachments") or [])
@@ -1144,13 +1129,13 @@ def send_draft(
             {
                 "success": False,
                 "error": (
-                    "not sent — the draft's record hash does not match what "
-                    "was presented. The recipients, subject, body or an "
-                    "attachment changed after the reviewer read it."
+                    "not sent — the draft's record file changed after it was "
+                    "presented. The recipients, subject, body or an attachment "
+                    "entry was edited after the reviewer read it."
                 ),
                 "draft_id": draft_id,
-                "presented_record": stored_hash[:8],
-                "current_record": live_hash[:8],
+                "presented_record": stored_seal[:8],
+                "current_record": (live_seal or "unreadable")[:8],
                 "note": (
                     "Do not retry and do not re-present silently. Tell the "
                     "user the draft changed between review and send, and stop."
@@ -1303,21 +1288,55 @@ def send_draft(
     # NEW (2026-09-14): Verify BOTH the local review path and the cypress
     # transport path. The local path might exist but cypress's copy may have
     # been deleted. We check both to ensure hermes-send will succeed.
+    # (b) and (c): the attachment BYTES, immediately before transport hand-off.
+    #
+    # Each attachment carries one stored digest, written at present time. Both
+    # checks compare freshly measured bytes against THAT stored value. Neither
+    # substitutes a recomputed value for the stored one, and neither treats an
+    # unmeasurable or unparseable digest as permission to continue:
+    #
+    #   (b) local  — hash the review copy the human opened.
+    #   (c) remote — hash the staged copy the transport actually reads.
+    #
+    # A stored digest that is missing, empty, or malformed refuses. It cannot
+    # mean "nothing to check": the only way to reach send_draft without one is
+    # for the record to have been edited, and an attachment whose content
+    # cannot be verified is not an attachment that needs no verification.
     missing_local = []
     missing_cypress = []
+    swapped_local = []
     swapped_cypress = []
-    
-    for a in draft.get("attachments", []):
-        # Check local (review) path
-        if not Path(a["path"]).is_file():
-            missing_local.append(a["path"])
-        
-        # Check cypress (transport) path if it exists in the record
+    unverifiable = []
+
+    for a in draft.get("attachments", []) or []:
+        if not isinstance(a, dict):
+            unverifiable.append(str(a)[:80])
+            continue
+
+        local_path = str(a.get("path", "") or "")
+        stored = a.get("content_sha256")
+        if not _is_sha256(stored):
+            # Covers empty, None, whitespace, wrong length, and non-strings.
+            unverifiable.append(local_path or "<no path>")
+            continue
+        stored = stored.strip()
+
+        # (b) local review copy
+        if not Path(local_path).is_file():
+            missing_local.append(local_path)
+        else:
+            local_live = _file_digest(Path(local_path))
+            if local_live is None:
+                missing_local.append(local_path)
+            elif local_live != stored:
+                swapped_local.append(local_path)
+
+        # (c) remote staged copy — the bytes the transport actually sends
         cypress_path = a.get("cypress_path")
         if cypress_path:
             try:
                 result = subprocess.run(
-                    ["ssh", "cypress", f"test -f {shlex.quote(cypress_path)}"],
+                    ["ssh", "cypress", f"test -f {shlex.quote(str(cypress_path))}"],
                     check=False,
                     capture_output=True,
                     # Generous: a TIMEOUT here would be read as "attachment
@@ -1326,44 +1345,33 @@ def send_draft(
                     timeout=int(os.environ.get("HERMES_DRAFT_SSH_TIMEOUT", "30")),
                 )
                 if result.returncode != 0:
-                    missing_cypress.append((a["path"], cypress_path))
+                    missing_cypress.append((local_path, cypress_path))
                 else:
-                    # Existence is not integrity. The transport reads its bytes
-                    # from HERE, on a host with its own trust boundary — the
-                    # record hash covers the path string and the LOCAL copy,
-                    # both of which stay identical when someone overwrites the
-                    # staged file in place. Re-hash the remote bytes and
-                    # compare against what was staged at present time, or the
-                    # reviewer's consent covers a path rather than a document.
-                    staged = str(a.get("content_sha256", "") or "")
                     live = _remote_sha256(
-                        cypress_path,
+                        str(cypress_path),
                         int(os.environ.get("HERMES_DRAFT_SSH_TIMEOUT", "30")),
                     )
-                    if not staged:
-                        # No digest to compare against is not "nothing to
-                        # check" — it is an attachment whose content cannot be
-                        # verified at all. present_draft populates this on
-                        # every path, so an empty one means the record was
-                        # edited. Refuse rather than wave it through.
-                        swapped_cypress.append((a["path"], cypress_path))
-                    elif live is None:
-                        # Readable a moment ago, unreadable now: treat as gone
-                        # rather than guess. Fail closed.
-                        missing_cypress.append((a["path"], cypress_path))
-                    elif live != staged:
-                        swapped_cypress.append((a["path"], cypress_path))
+                    if live is None:
+                        # Readable a moment ago, unmeasurable now: fail closed.
+                        missing_cypress.append((local_path, cypress_path))
+                    elif live != stored:
+                        swapped_cypress.append((local_path, cypress_path))
             except Exception as e:
                 logger.warning(
-                    "Failed to check cypress path %s: %s",
-                    cypress_path, e
+                    "Failed to check cypress path %s: %s", cypress_path, e
                 )
-                missing_cypress.append((a["path"], cypress_path))
-    
-    if missing_local or missing_cypress or swapped_cypress:
+                missing_cypress.append((local_path, cypress_path))
+
+    if (
+        missing_local
+        or missing_cypress
+        or swapped_local
+        or swapped_cypress
+        or unverifiable
+    ):
         error_parts = []
         if swapped_cypress:
-            swapped_list = [f"{local} -> {cypress}" for local, cypress in swapped_cypress]
+            swapped_list = [f"{local} -> {cyp}" for local, cyp in swapped_cypress]
             error_parts.append(
                 f"{len(swapped_cypress)} staged attachment(s) changed CONTENT "
                 f"since the draft was presented: {'; '.join(swapped_list)}. "
@@ -1371,18 +1379,30 @@ def send_draft(
                 "reviewed. Do not retry: present the draft again so a human "
                 "sees the current document."
             )
+        if swapped_local:
+            error_parts.append(
+                f"{len(swapped_local)} local file(s) changed CONTENT since the "
+                f"draft was presented: {', '.join(swapped_local)}. The document "
+                "on disk is not the one that was reviewed."
+            )
+        if unverifiable:
+            error_parts.append(
+                f"{len(unverifiable)} attachment(s) carry no usable content "
+                f"digest and cannot be verified: {', '.join(unverifiable)}. "
+                "A record without a digest was edited after it was written."
+            )
         if missing_local:
             error_parts.append(
                 f"{len(missing_local)} local file(s) no longer exist: "
                 f"{', '.join(missing_local)}"
             )
         if missing_cypress:
-            cypress_list = [f"{local} -> {cypress}" for local, cypress in missing_cypress]
+            cypress_list = [f"{local} -> {cyp}" for local, cyp in missing_cypress]
             error_parts.append(
                 f"{len(missing_cypress)} cypress copy/copies no longer exist: "
                 f"{'; '.join(cypress_list)}"
             )
-        
+
         return json.dumps(
             {
                 "success": False,
