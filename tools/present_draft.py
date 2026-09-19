@@ -1296,6 +1296,7 @@ def send_draft(
     # been deleted. We check both to ensure hermes-send will succeed.
     missing_local = []
     missing_cypress = []
+    swapped_cypress = []
     
     for a in draft.get("attachments", []):
         # Check local (review) path
@@ -1317,6 +1318,25 @@ def send_draft(
                 )
                 if result.returncode != 0:
                     missing_cypress.append((a["path"], cypress_path))
+                else:
+                    # Existence is not integrity. The transport reads its bytes
+                    # from HERE, on a host with its own trust boundary — the
+                    # record hash covers the path string and the LOCAL copy,
+                    # both of which stay identical when someone overwrites the
+                    # staged file in place. Re-hash the remote bytes and
+                    # compare against what was staged at present time, or the
+                    # reviewer's consent covers a path rather than a document.
+                    staged = str(a.get("content_sha256", "") or "")
+                    live = _remote_sha256(
+                        cypress_path,
+                        int(os.environ.get("HERMES_DRAFT_SSH_TIMEOUT", "30")),
+                    )
+                    if staged and live and live != staged:
+                        swapped_cypress.append((a["path"], cypress_path))
+                    elif staged and live is None:
+                        # Readable a moment ago, unreadable now: treat as gone
+                        # rather than guess. Fail closed.
+                        missing_cypress.append((a["path"], cypress_path))
             except Exception as e:
                 logger.warning(
                     "Failed to check cypress path %s: %s",
@@ -1324,8 +1344,17 @@ def send_draft(
                 )
                 missing_cypress.append((a["path"], cypress_path))
     
-    if missing_local or missing_cypress:
+    if missing_local or missing_cypress or swapped_cypress:
         error_parts = []
+        if swapped_cypress:
+            swapped_list = [f"{local} -> {cypress}" for local, cypress in swapped_cypress]
+            error_parts.append(
+                f"{len(swapped_cypress)} staged attachment(s) changed CONTENT "
+                f"since the draft was presented: {'; '.join(swapped_list)}. "
+                "The file the transport would send is not the file that was "
+                "reviewed. Do not retry: present the draft again so a human "
+                "sees the current document."
+            )
         if missing_local:
             error_parts.append(
                 f"{len(missing_local)} local file(s) no longer exist: "

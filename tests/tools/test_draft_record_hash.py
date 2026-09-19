@@ -20,11 +20,13 @@ read to the envelope that leaves the machine.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
+import pathlib
 
 import pytest
 
-from agent.approval_tokens import ApprovalRegistry
+from agent.approval_tokens import ApprovalRegistry, KIND_DRAFT
 import agent.approval_tokens as approval_tokens
 import tools.present_draft as pd
 
@@ -66,6 +68,82 @@ def _present(*, to=KNOWN, cc="", subject="contract test", body="Body text.",
     )
     assert out["success"] is True, out
     return out
+
+
+def test_remote_bytes_swapped_in_place_is_refused(tmp_path, monkeypatch, _fresh):
+    """The transport reads REMOTE bytes; verify those, not just the path.
+
+    Hashing cypress_path catches a REPOINTED attachment. It does not catch an
+    attacker overwriting the file in place at the same path on the staging
+    host — the local file, the local digest, and the whole record are
+    untouched, so every local check agrees while different bytes ride out.
+    Found by an adversarial review of the repoint fix: the same bug class one
+    level further out. The reviewer consents to CONTENT, not to a path.
+    """
+    local = tmp_path / "invoice.pdf"
+    local.write_bytes(b"ORIGINAL REVIEWED INVOICE - 500")
+
+    remote_fs = {}
+
+    def fake_publish(path, **kw):
+        p = pathlib.Path(path)
+        digest = hashlib.sha256(p.read_bytes()).hexdigest()
+        remote = f"/srv/hermes-staging/{digest[:8]}/{p.name}"
+        remote_fs[remote] = p.read_bytes()
+        return remote, digest
+
+    monkeypatch.setattr(pd, "_publish_attachment_to_cypress", fake_publish)
+    monkeypatch.setattr(
+        pd,
+        "_remote_sha256",
+        lambda rp, timeout=30: (
+            hashlib.sha256(remote_fs[rp]).hexdigest() if rp in remote_fs else None
+        ),
+    )
+    # Existence is checked by an inline `ssh cypress test -f` in send_draft;
+    # stub subprocess so it answers from our fake remote filesystem.
+    def fake_run(cmd, **kwargs):
+        class R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        r = R()
+        if cmd[:2] == ["ssh", "cypress"] and "test -f" in cmd[2]:
+            target = cmd[2].split("test -f ", 1)[1].strip().strip("'\"")
+            r.returncode = 0 if target in remote_fs else 1
+        return r
+
+    monkeypatch.setattr(pd.subprocess, "run", fake_run)
+    monkeypatch.delenv("HERMES_DRAFT_SKIP_CYPRESS", raising=False)
+
+    out = _present(attachments=[local])
+    draft_id = out["draft_id"]
+    record = pd.load_draft(draft_id)
+    remote_path = record["attachments"][0]["cypress_path"]
+
+    # The attacker never touches the local file or the record: only the
+    # already-staged remote copy, at the very same path.
+    remote_fs[remote_path] = b"TAMPERED INVOICE - PAY ATTACKER 999999"
+    assert pathlib.Path(record["attachments"][0]["path"]).read_bytes().startswith(
+        b"ORIGINAL"
+    )
+    assert pd.canonical_record_digest(record) == record["record_hash"]
+
+    out = json.loads(
+        pd.send_draft(
+            draft_id=draft_id,
+            approval_token=_fresh.mint(
+                kind=KIND_DRAFT, subject_id=draft_id, session_id=DESKTOP_SESSION
+            ).token,
+            session_id=DESKTOP_SESSION,
+        )
+    )
+    assert out.get("success") is not True, (
+        "swapped remote bytes were accepted: the reviewer approved content "
+        "they never saw"
+    )
+    assert "content" in (out.get("error", "") + out.get("note", "")).lower()
 
 
 # --- 1. record hash -------------------------------------------------------
