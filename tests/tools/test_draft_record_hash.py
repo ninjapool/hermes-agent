@@ -19,6 +19,7 @@ read to the envelope that leaves the machine.
 
 from __future__ import annotations
 
+import copy
 import json
 
 import pytest
@@ -42,7 +43,9 @@ def _fresh(monkeypatch, tmp_path):
     draft_dir = tmp_path / "drafts"
     draft_dir.mkdir()
     monkeypatch.setattr(pd, "_DRAFT_DIR", draft_dir)
-    monkeypatch.setattr(pd, "_publish_attachment_to_cypress", lambda p: (None, None))
+    monkeypatch.setattr(
+        pd, "_publish_attachment_to_cypress", lambda p, **kw: (None, None)
+    )
     monkeypatch.setattr(
         pd, "_verified_addresses", lambda: frozenset({KNOWN.lower()})
     )
@@ -66,6 +69,45 @@ def _present(*, to=KNOWN, cc="", subject="contract test", body="Body text.",
 
 
 # --- 1. record hash -------------------------------------------------------
+
+
+def test_repointing_the_cypress_path_moves_the_digest(tmp_path):
+    """The transport path is hashed, not just the local one.
+
+    ``cypress_path`` is where hermes-send actually reads the bytes from
+    (``_resolve_attachments``). send_draft only checks that path still
+    EXISTS -- never what is in it. If the digest ignored it, repointing it at
+    another file on cypress would pass the existence check AND the hash check
+    and attach something the reviewer never saw. The local ``content_sha256``
+    does not cover this: it digests the local copy, not the remote one.
+    """
+    record = {
+        "from": "f@x.com",
+        "to": KNOWN,
+        "cc": "",
+        "subject": "s",
+        "body": "b",
+        "attachments": [
+            {
+                "path": "/local/report.pdf",
+                "name": "report.pdf",
+                "bytes": 100,
+                "content_sha256": "aa" * 32,
+                "cypress_path": "/home/ds/.hermes-attachments/report.pdf",
+            }
+        ],
+    }
+    before = pd.canonical_record_digest(record)
+
+    repointed = copy.deepcopy(record)
+    repointed["attachments"][0]["cypress_path"] = (
+        "/home/ds/.hermes-attachments/other.pdf"
+    )
+    assert pd.canonical_record_digest(repointed) != before
+
+    renamed = copy.deepcopy(record)
+    renamed["attachments"][0]["name"] = "invoice.pdf"
+    assert pd.canonical_record_digest(renamed) != before
 
 
 def test_present_draft_stores_and_shows_the_record_hash(tmp_path):

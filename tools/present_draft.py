@@ -499,6 +499,16 @@ def canonical_record_digest(record: Dict[str, Any]) -> str:
                 str(att.get("path", "") or ""),
                 int(att.get("bytes", 0) or 0),
                 str(att.get("content_sha256", "") or ""),
+                # The filename the recipient sees, and — load-bearing — the
+                # cypress path the transport actually reads the bytes FROM
+                # (_resolve_attachments:436). send_draft only checks that path
+                # still EXISTS, never what is in it, so leaving it unhashed
+                # would let a repointed cypress_path pass both gates and
+                # attach a different file than the one reviewed. The local
+                # content_sha256 does not cover that: it digests the local
+                # copy, not the remote one the send reads.
+                str(att.get("name", "") or ""),
+                str(att.get("cypress_path", "") or ""),
             ]
         )
     payload.append(["attachments", attachments])
