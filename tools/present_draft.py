@@ -1038,10 +1038,19 @@ def _live_record_digest(record: Dict[str, Any]) -> str:
         try:
             content = path.read_bytes()
             entry["bytes"] = len(content)
-            entry["content_sha256"] = hashlib.sha256(content).hexdigest()
+            fresh = hashlib.sha256(content).hexdigest()
         except OSError:
             entry["bytes"] = -1
-            entry["content_sha256"] = "UNREADABLE"
+            fresh = "UNREADABLE"
+        # Fold the STORED digest in alongside the freshly computed one. If we
+        # only kept `fresh`, the stored field would ride free of the hash:
+        # blanking it on disk would leave the digest identical, and the
+        # post-consent remote check reads that same field and skips itself
+        # when it is falsy. One attacker-controlled byte, both defences
+        # silent. Recording the pair means a rewritten stored digest moves
+        # the hash, while a genuinely swapped local file still moves it too.
+        stored = str(att.get("content_sha256", "") or "")
+        entry["content_sha256"] = f"{fresh}|{stored}" if stored != fresh else fresh
         attachments.append(entry)
     live["attachments"] = attachments
     return canonical_record_digest(live)
@@ -1331,12 +1340,19 @@ def send_draft(
                         cypress_path,
                         int(os.environ.get("HERMES_DRAFT_SSH_TIMEOUT", "30")),
                     )
-                    if staged and live and live != staged:
+                    if not staged:
+                        # No digest to compare against is not "nothing to
+                        # check" — it is an attachment whose content cannot be
+                        # verified at all. present_draft populates this on
+                        # every path, so an empty one means the record was
+                        # edited. Refuse rather than wave it through.
                         swapped_cypress.append((a["path"], cypress_path))
-                    elif staged and live is None:
+                    elif live is None:
                         # Readable a moment ago, unreadable now: treat as gone
                         # rather than guess. Fail closed.
                         missing_cypress.append((a["path"], cypress_path))
+                    elif live != staged:
+                        swapped_cypress.append((a["path"], cypress_path))
             except Exception as e:
                 logger.warning(
                     "Failed to check cypress path %s: %s",

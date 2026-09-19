@@ -70,6 +70,102 @@ def _present(*, to=KNOWN, cc="", subject="contract test", body="Body text.",
     return out
 
 
+def test_blanked_content_sha256_still_refuses_swapped_remote_bytes(
+    tmp_path, monkeypatch, _fresh
+):
+    """Blanking a stored digest must not silently disable the gate that reads it.
+
+    _live_record_digest recomputes content_sha256 from the local file and
+    overwrites the stored value, so the stored field itself rides free of the
+    record hash: blank it on disk and the digest still matches. The
+    post-consent remote check then reads that same blanked field, finds it
+    falsy, and skips the comparison. Two defences, one attacker-controlled
+    byte. An absent digest is an UNVERIFIABLE attachment, not a safe one.
+    """
+    local = tmp_path / "invoice.pdf"
+    local.write_bytes(b"ORIGINAL REVIEWED INVOICE - 500")
+
+    remote_fs = {}
+
+    def fake_publish(path, **kw):
+        p = pathlib.Path(path)
+        digest = hashlib.sha256(p.read_bytes()).hexdigest()
+        remote = f"/srv/hermes-staging/{digest[:8]}/{p.name}"
+        remote_fs[remote] = p.read_bytes()
+        return remote, digest
+
+    monkeypatch.setattr(pd, "_publish_attachment_to_cypress", fake_publish)
+    monkeypatch.setattr(
+        pd,
+        "_remote_sha256",
+        lambda rp, timeout=30: (
+            hashlib.sha256(remote_fs[rp]).hexdigest() if rp in remote_fs else None
+        ),
+    )
+
+    def fake_run(cmd, **kwargs):
+        class R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        r = R()
+        if cmd[:2] == ["ssh", "cypress"] and "test -f" in cmd[2]:
+            target = cmd[2].split("test -f ", 1)[1].strip().strip("'\"")
+            r.returncode = 0 if target in remote_fs else 1
+        return r
+
+    monkeypatch.setattr(pd.subprocess, "run", fake_run)
+    monkeypatch.delenv("HERMES_DRAFT_SKIP_CYPRESS", raising=False)
+
+    out = _present(attachments=[local])
+    draft_id = out["draft_id"]
+    record = pd.load_draft(draft_id)
+    remote_path = record["attachments"][0]["cypress_path"]
+
+    # Blank the stored digest on disk, then swap the remote bytes.
+    record["attachments"][0]["content_sha256"] = ""
+    (pd._DRAFT_DIR / f"{draft_id}.json").write_text(json.dumps(record))
+    remote_fs[remote_path] = b"TAMPERED INVOICE - PAY ATTACKER 999999"
+
+    result = json.loads(
+        pd.send_draft(
+            draft_id=draft_id,
+            approval_token=_fresh.mint(
+                kind=KIND_DRAFT, subject_id=draft_id, session_id=DESKTOP_SESSION
+            ).token,
+            session_id=DESKTOP_SESSION,
+        )
+    )
+    assert result.get("success") is not True, (
+        "blanking content_sha256 disabled the remote-content check and the "
+        "swapped attachment was sent"
+    )
+
+
+def test_blanking_a_stored_attachment_digest_moves_the_record_hash(
+    tmp_path, monkeypatch, _fresh
+):
+    """The stored digest field must itself be covered by the record hash."""
+    local = tmp_path / "doc.pdf"
+    local.write_bytes(b"REVIEWED CONTENT")
+
+    monkeypatch.setattr(
+        pd,
+        "_publish_attachment_to_cypress",
+        lambda p, **kw: (f"/srv/staging/x/{pathlib.Path(p).name}", "deadbeef"),
+    )
+    out = _present(attachments=[local])
+    record = pd.load_draft(out["draft_id"])
+
+    assert pd._live_record_digest(record) == record["record_hash"]
+    blanked = copy.deepcopy(record)
+    blanked["attachments"][0]["content_sha256"] = ""
+    assert pd._live_record_digest(blanked) != record["record_hash"], (
+        "blanking the stored attachment digest left the record hash unchanged"
+    )
+
+
 def test_remote_bytes_swapped_in_place_is_refused(tmp_path, monkeypatch, _fresh):
     """The transport reads REMOTE bytes; verify those, not just the path.
 
