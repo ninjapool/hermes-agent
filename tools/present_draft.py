@@ -394,6 +394,15 @@ def _resolve_attachments(
             "path": str(path),           # Review path (local to gateway's client)
             "name": path.name,
             "bytes": size,
+            # Content digest of the LOCAL file, recorded unconditionally.
+            #
+            # Distinct from the "sha256" below, which only exists when the file
+            # was staged to cypress and is a staging-verification value. The
+            # record hash needs a digest that is present on every attachment on
+            # every path — including HERMES_DRAFT_SKIP_CYPRESS runs — or the
+            # stored and recomputed digests disagree for reasons that have
+            # nothing to do with tampering.
+            "content_sha256": _file_digest(path),
         }
         if os.environ.get("HERMES_DRAFT_SKIP_CYPRESS") != "1":
             try:
@@ -431,6 +440,143 @@ def _resolve_attachments(
     return resolved, errors
 
 
+# --- Record hash ----------------------------------------------------------
+#
+# The reviewer approves an ENVELOPE: who receives what. Between the moment the
+# draft is rendered and the moment it is sent, the record lives as a JSON file
+# under HERMES_HOME, readable and writable by every process that shares the
+# home — the Telegram gateway, a cron job, a second serve, a subagent's
+# terminal. Nothing tied the envelope the reviewer read to the envelope that
+# leaves the machine.
+#
+# The digest closes that: present_draft records it, the render and the card
+# both show its first 8 characters, and send_draft recomputes it from disk and
+# refuses on any difference. It is a TAMPER-EVIDENCE check, not a security
+# boundary — anyone who can rewrite the record can rewrite the stored hash
+# too. What it makes impossible is a SILENT change: to move the recipient you
+# must also move the prefix the reviewer saw.
+
+_HASHED_FIELDS = ("from", "to", "cc", "subject", "body")
+
+
+def _file_digest(path: Path) -> str:
+    """SHA-256 of a file's bytes, or a sentinel if it cannot be read.
+
+    The sentinel is deliberately a value, not an exception: an attachment that
+    became unreadable is a CHANGE to what would be sent, and it should move the
+    record digest rather than crash the comparison.
+    """
+    import hashlib
+
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return "UNREADABLE"
+
+
+def canonical_record_digest(record: Dict[str, Any]) -> str:
+    """SHA-256 over the canonical form of a draft record.
+
+    Covers the envelope fields and each attachment's own SHA-256 — so swapping
+    an attachment's CONTENT moves the digest even though the record's text is
+    untouched. Deliberately excludes draft_id, created_at, session_id and the
+    stored hash itself: those are bookkeeping, not the thing being approved,
+    and including them would make the digest impossible to recompute.
+
+    The canonical form is a JSON array with sorted keys and no whitespace
+    variance, so the digest does not depend on how the file happens to be
+    formatted on disk.
+    """
+    import hashlib
+
+    payload: List[Any] = [
+        [field, str(record.get(field, "") or "")] for field in _HASHED_FIELDS
+    ]
+    attachments = []
+    for att in record.get("attachments") or []:
+        attachments.append(
+            [
+                str(att.get("path", "") or ""),
+                int(att.get("bytes", 0) or 0),
+                str(att.get("content_sha256", "") or ""),
+            ]
+        )
+    payload.append(["attachments", attachments])
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+# --- Verified address book ------------------------------------------------
+#
+# A wrong recipient is the one send error that cannot be retracted, and the
+# shape it takes in practice is not a garbled address — it is a plausible one:
+# a transposed local part, last year's contact at the same company, a personal
+# address where the work address was meant. Those read as correct in a list of
+# five, which is exactly why they get approved.
+#
+# So the check is not "is this address well-formed" but "have I sent to this
+# address before, and was that confirmed". The book is a plain text file the
+# HUMAN curates; nothing in this module ever writes to it. An address book that
+# learned from its own sends would certify the first mistake as correct.
+
+_ADDRESS_BOOK = get_hermes_home() / "verified_addresses.txt"
+
+_ADDR_IN_TEXT = re.compile(r"[^<>,;\s]+@[^<>,;\s]+")
+
+
+def _verified_addresses() -> frozenset:
+    """Addresses the human has confirmed, lowercased. Missing file -> empty.
+
+    Empty is the loud direction: every address gets flagged, which is noise
+    that prompts someone to curate the book. The quiet direction — treating an
+    unreadable book as "everything is fine" — would silently disable the check
+    on exactly the machine where the file went missing.
+    """
+    try:
+        raw = _ADDRESS_BOOK.read_text(encoding="utf-8")
+    except OSError:
+        return frozenset()
+    out = set()
+    for line in raw.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        for match in _ADDR_IN_TEXT.findall(line):
+            out.add(match.strip().lower())
+    return frozenset(out)
+
+
+def _split_addresses(value: str) -> List[str]:
+    """Split a To/Cc header value into individual entries, commas and semicolons."""
+    return [part.strip() for part in re.split(r"[,;]", value or "") if part.strip()]
+
+
+def _bare_address(entry: str) -> str:
+    """The address out of ``Name <addr@host>`` or a bare ``addr@host``."""
+    match = _ADDR_IN_TEXT.search(entry)
+    return (match.group(0) if match else entry).strip().strip("<>").lower()
+
+
+def annotate_addresses(value: str, known: Optional[frozenset] = None) -> str:
+    """Return the header value with ``[NEW ADDRESS]`` after each unknown entry.
+
+    Per-entry, not per-header: a Cc of five where one is unfamiliar must point
+    at the one, not colour the whole line. The annotation is PRESENTATION only
+    — it is applied at render time and never written into the record, so it
+    cannot perturb the digest or reach the send transport.
+    """
+    if not value:
+        return value
+    book = _verified_addresses() if known is None else known
+    out = []
+    for entry in _split_addresses(value):
+        if _bare_address(entry) in book:
+            out.append(entry)
+        else:
+            out.append(f"{entry} [NEW ADDRESS]")
+    return ", ".join(out)
+
+
 def _session_source() -> str:
     """The current session's SOURCE, read the way production binds it.
 
@@ -455,6 +601,7 @@ def _render(
     cc: Optional[str],
     resolved: List[Dict[str, Any]],
     from_addr: str = "",
+    record_hash: str = "",
 ) -> str:
     """Render the reviewable draft, attachment lines included.
 
@@ -464,15 +611,21 @@ def _render(
     lines = []
     if from_addr:
         lines.append(f"**From:** {from_addr}")
-    lines.append(f"**To:** {to}")
+    lines.append(f"**To:** {annotate_addresses(to)}")
     if cc:
-        lines.append(f"**Cc:** {cc}")
+        lines.append(f"**Cc:** {annotate_addresses(cc)}")
     lines.append(f"**Subject:** {subject}")
     for i, att in enumerate(resolved, 1):
         lines.append(
             f"**Attachment {i}/{len(resolved)}:** `{att['path']}` "
             f"· {att['bytes']:,} bytes"
         )
+    # The record prefix is the reviewer's handle on THIS exact envelope. It is
+    # the same 8 characters the approval card will show, so the two can be
+    # compared by eye; if they differ, the record moved between render and
+    # send and the send will refuse.
+    if record_hash:
+        lines.append(f"**Record:** {record_hash[:8]}")
     lines += ["", "---", body.strip(), "---"]
     # The MEDIA: lines are what make the files openable in chat. They are the
     # payload of this whole tool; everything above is context for them.
@@ -582,6 +735,10 @@ def present_draft(
         "body": body,
         "attachments": resolved,
     }
+    # Stamped before the record is written so the file on disk always carries
+    # its own digest. send_draft recomputes this from the file and refuses on
+    # any difference.
+    record["record_hash"] = canonical_record_digest(record)
     try:
         _DRAFT_DIR.mkdir(parents=True, exist_ok=True)
         _draft_path(draft_id).write_text(
@@ -598,7 +755,9 @@ def present_draft(
             "success": True,
             "draft_id": draft_id,
             "attachment_count": len(resolved),
-            "rendered": _render(to, subject, body, cc, resolved, from_addr),
+            "rendered": _render(
+                to, subject, body, cc, resolved, from_addr, record["record_hash"]
+            ),
             "note": (
                 "Post 'rendered' VERBATIM as your reply — the MEDIA: lines are "
                 "what make the files openable. Do not add, remove or reword an "
@@ -751,16 +910,23 @@ def _draft_card_description(draft: Dict[str, Any]) -> str:
     """
     import hashlib
 
-    lines = [
-        f"draft_id: {draft.get('draft_id', '')}",
-    ]
+    # The record prefix rides on the FIRST line, with the draft id.
+    #
+    # Not a line of its own: the desktop's floating approval card renders the
+    # description as a single truncated line (approval.tsx:96) and only reveals
+    # the rest on expand. A verification value the reviewer has to click to see
+    # is a verification value that does not get checked.
+    head = f"draft_id: {draft.get('draft_id', '')}"
+    if draft.get("record_hash"):
+        head += f" — Record: {str(draft.get('record_hash'))[:8]}"
+    lines = [head]
     # The sending identity leads the card: it is the field a misdirected send
     # gets wrong in the way that cannot be retracted.
     if draft.get("from"):
         lines.append(f"From: {draft.get('from')}")
-    lines.append(f"To: {draft.get('to', '')}")
+    lines.append(f"To: {annotate_addresses(str(draft.get('to', '') or ''))}")
     if draft.get("cc"):
-        lines.append(f"Cc: {draft.get('cc')}")
+        lines.append(f"Cc: {annotate_addresses(str(draft.get('cc')))}")
     lines.append(f"Subject: {draft.get('subject', '')}")
 
     attachments = draft.get("attachments") or []
@@ -843,6 +1009,34 @@ def _structural_approval_surface() -> tuple[str, Any]:
     return session_key, notify_cb
 
 
+def _live_record_digest(record: Dict[str, Any]) -> str:
+    """The digest of the record as it stands RIGHT NOW, files included.
+
+    Re-stats and re-hashes every attachment from disk rather than trusting the
+    stored values, so a file swapped between render and send moves the digest
+    even though the JSON was never touched. An unreadable attachment is folded
+    in as a sentinel, which also moves the digest — a file that vanished is a
+    change to what would be sent.
+    """
+    import hashlib
+
+    live = dict(record)
+    attachments = []
+    for att in record.get("attachments") or []:
+        entry = dict(att)
+        path = Path(str(att.get("path", "") or ""))
+        try:
+            content = path.read_bytes()
+            entry["bytes"] = len(content)
+            entry["content_sha256"] = hashlib.sha256(content).hexdigest()
+        except OSError:
+            entry["bytes"] = -1
+            entry["content_sha256"] = "UNREADABLE"
+        attachments.append(entry)
+    live["attachments"] = attachments
+    return canonical_record_digest(live)
+
+
 def send_draft(
     draft_id: str = "",
     approval_token: str = "",
@@ -870,6 +1064,80 @@ def send_draft(
                     "first; drafts are not sendable until rendered."
                 ),
             }
+        )
+
+    # ── Record-hash re-verification ───────────────────────────────────────
+    # Before consent is sought, before a card is raised, before a token is
+    # looked up: does the record on disk still describe the envelope the
+    # reviewer read? The draft file is writable by every process sharing
+    # HERMES_HOME, so "I presented it" and "this is what I presented" are
+    # different claims, and only the digest checks the second one.
+    #
+    # Placed FIRST deliberately. Raising a card for a tampered record would
+    # ask the human to approve the modified envelope — the card is built from
+    # the same file — so the check has to come before anything asks.
+    stored_hash = str(draft.get("record_hash", "") or "")
+    if not stored_hash:
+        # Pre-hash drafts, rendered before this check existed. Refuse rather
+        # than wave through: a missing hash is indistinguishable from one an
+        # attacker stripped, and re-presenting is cheap.
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    "not sent — this draft carries no record hash, so what is "
+                    "on disk cannot be matched against what was reviewed. "
+                    "Re-present it with present_draft and have it approved again."
+                ),
+                "draft_id": draft_id,
+            },
+            ensure_ascii=False,
+        )
+    live_hash = _live_record_digest(draft)
+    if live_hash != stored_hash:
+        # A vanished attachment also moves the digest, but "the file is gone"
+        # and "the envelope was altered" call for different responses, and the
+        # existing existence check (below, at send time) already words the
+        # first one precisely. Diagnose it here so the hash gate does not
+        # swallow the more specific message just by running earlier.
+        missing = [
+            str(att.get("path", ""))
+            for att in (draft.get("attachments") or [])
+            if not Path(str(att.get("path", "") or "")).exists()
+        ]
+        if missing:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        f"not sent — {len(missing)} local file(s) no longer exist: "
+                        + ", ".join(missing[:5])
+                    ),
+                    "draft_id": draft_id,
+                    "note": (
+                        "The reviewer approved openable files. Re-publish them "
+                        "and re-present the draft."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    "not sent — the draft's record hash does not match what "
+                    "was presented. The recipients, subject, body or an "
+                    "attachment changed after the reviewer read it."
+                ),
+                "draft_id": draft_id,
+                "presented_record": stored_hash[:8],
+                "current_record": live_hash[:8],
+                "note": (
+                    "Do not retry and do not re-present silently. Tell the "
+                    "user the draft changed between review and send, and stop."
+                ),
+            },
+            ensure_ascii=False,
         )
 
     # Fall back to the token the gateway minted for this turn.
