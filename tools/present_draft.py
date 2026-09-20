@@ -22,6 +22,7 @@ and the sent object are the same object.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -390,10 +391,27 @@ def _resolve_attachments(
         # sat nowhere the transport could reach — the exact failure this
         # staging exists to prevent. On any real publish failure we still
         # refuse the whole draft.
+        # Content digest of the LOCAL file, recorded unconditionally.
+        #
+        # Distinct from the "sha256" below, which only exists when the file
+        # was staged to cypress and is a staging-verification value. Send-time
+        # checks (b) and (c) both compare against THIS value, on every path
+        # including HERMES_DRAFT_SKIP_CYPRESS runs.
+        #
+        # If it cannot be computed the draft is refused here rather than
+        # persisted: a record whose digest is absent is a record whose
+        # attachment can never be verified, and writing one would hand
+        # send_draft an unanswerable question.
+        content_digest = _file_digest(path)
+        if content_digest is None:
+            raise StagingError(
+                f"could not read {path} to digest it; the draft was not saved"
+            )
         entry = {
             "path": str(path),           # Review path (local to gateway's client)
             "name": path.name,
             "bytes": size,
+            "content_sha256": content_digest,
         }
         if os.environ.get("HERMES_DRAFT_SKIP_CYPRESS") != "1":
             try:
@@ -431,6 +449,225 @@ def _resolve_attachments(
     return resolved, errors
 
 
+# --- Record hash ----------------------------------------------------------
+#
+# The reviewer approves an ENVELOPE: who receives what. Between the moment the
+# draft is rendered and the moment it is sent, the record lives as a JSON file
+# under HERMES_HOME, readable and writable by every process that shares the
+# home — the Telegram gateway, a cron job, a second serve, a subagent's
+# terminal. Nothing tied the envelope the reviewer read to the envelope that
+# leaves the machine.
+#
+# The digest closes that: present_draft records it, the render and the card
+# both show its first 8 characters, and send_draft recomputes it from disk and
+# refuses on any difference. It is a TAMPER-EVIDENCE check, not a security
+# boundary — anyone who can rewrite the record can rewrite the stored hash
+# too. What it makes impossible is a SILENT change: to move the recipient you
+# must also move the prefix the reviewer saw.
+
+_SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+
+
+def _file_digest(path: Path) -> Optional[str]:
+    """SHA-256 of a file's bytes, or None if it cannot be read.
+
+    None means "could not measure", and every caller treats that as a refusal.
+    The previous version returned an "UNREADABLE" sentinel so the value could
+    be folded into a recomputed digest; there is no recomputed digest any
+    more, and a sentinel that flows onward is exactly how an unverifiable
+    attachment gets waved through.
+    """
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _is_sha256(value: Any) -> bool:
+    """True only for a well-formed lowercase hex SHA-256.
+
+    Everything else — empty, None, whitespace, wrong length, a list, an int —
+    is malformed, and malformed always refuses. A stored digest that cannot be
+    parsed is an attachment whose content cannot be verified, never an
+    attachment that needs no verification.
+    """
+    return isinstance(value, str) and bool(_SHA256_RE.match(value.strip()))
+
+
+def _seal_path(draft_id: str) -> Path:
+    """Sidecar holding the seal for a draft record file."""
+    return _DRAFT_DIR / f"{draft_id}.seal"
+
+
+def seal_bytes(raw: bytes) -> str:
+    """The seal IS the SHA-256 of the record file's exact bytes.
+
+    No field extraction, no canonicalisation, no recomputation. The previous
+    design digested a *reconstruction* of the record and recomputed some
+    fields from disk while building it; three separate holes came out of that
+    single idea, each one a stored value silently shadowed by a recomputed
+    one. Hashing the literal bytes removes the category: there is nothing to
+    shadow because nothing is rebuilt.
+    """
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _stored_seal(draft_id: str) -> Optional[str]:
+    """The seal written at present time, or None if absent/malformed."""
+    try:
+        raw = _seal_path(draft_id).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return raw if _is_sha256(raw) else None
+
+
+def _live_seal(draft_id: str) -> Optional[str]:
+    """The seal of the record file as it exists right now."""
+    try:
+        return seal_bytes(_draft_path(draft_id).read_bytes())
+    except OSError:
+        return None
+
+
+# --- Verified address book ------------------------------------------------
+#
+# A wrong recipient is the one send error that cannot be retracted, and the
+# shape it takes in practice is not a garbled address — it is a plausible one:
+# a transposed local part, last year's contact at the same company, a personal
+# address where the work address was meant. Those read as correct in a list of
+# five, which is exactly why they get approved.
+#
+# So the check is not "is this address well-formed" but "have I sent to this
+# address before, and was that confirmed". The book is a plain text file the
+# HUMAN curates; nothing in this module ever writes to it. An address book that
+# learned from its own sends would certify the first mistake as correct.
+
+_ADDRESS_BOOK = get_hermes_home() / "verified_addresses.txt"
+
+_ADDR_IN_TEXT = re.compile(r"[^<>,;\s]+@[^<>,;\s]+")
+# One entry: an address, with an optional display name and angle brackets
+# around it. Used to walk a header that separates entries with whitespace
+# rather than commas -- the display name's own spaces stay inside the match.
+_ADDR_ENTRY = re.compile(r"[^<>,;\s]+@[^<>,;\s]+>?")
+
+
+def _verified_addresses() -> frozenset:
+    """Addresses the human has confirmed, lowercased. Missing file -> empty.
+
+    Empty is the loud direction: every address gets flagged, which is noise
+    that prompts someone to curate the book. The quiet direction — treating an
+    unreadable book as "everything is fine" — would silently disable the check
+    on exactly the machine where the file went missing.
+    """
+    try:
+        raw = _ADDRESS_BOOK.read_text(encoding="utf-8")
+    except OSError:
+        return frozenset()
+    out = set()
+    for line in raw.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        for match in _ADDR_IN_TEXT.findall(line):
+            out.add(match.strip().lower())
+    return frozenset(out)
+
+
+def _split_addresses(value: str) -> List[str]:
+    """Split a To/Cc header value into individual entries.
+
+    Commas and semicolons are the conventional separators, but they are not
+    the only ones that occur: a header written with a space, a tab, or a
+    newline between two addresses is trivially produced by a model or a
+    copy-paste. Splitting only on ``[,;]`` made ``a@x.test b@y.test`` a SINGLE
+    entry, and since ``_bare_address`` takes the first address it finds, the
+    second recipient never entered the new-address decision and was never
+    flagged on either surface — a real extra recipient, riding along inside
+    another's entry, with no tampering required.
+
+    Whitespace only separates entries BETWEEN addresses, never inside one:
+    ``Koto KK <a@x.test>`` is one entry, not three. The split is therefore
+    anchored on the boundary between an address and the text that follows it.
+    """
+    if not value:
+        return []
+    parts: List[str] = []
+    for chunk in re.split(r"[,;]", value):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        # Walk the addresses in this chunk. One address -> the chunk is a
+        # single entry and keeps its display name intact. Two or more -> the
+        # chunk packed several recipients together, so each becomes its own
+        # entry, carrying the text that immediately precedes it.
+        spans = [m.span() for m in _ADDR_ENTRY.finditer(chunk)]
+        if len(spans) <= 1:
+            parts.append(chunk)
+            continue
+        starts = [0] + [e for _, e in spans[:-1]]
+        ends = [e for _, e in spans[:-1]] + [len(chunk)]
+        for start, end in zip(starts, ends):
+            piece = chunk[start:end].strip()
+            if piece:
+                parts.append(piece)
+    return parts
+
+
+def _bare_address(entry: str) -> str:
+    """The address out of ``Name <addr@host>`` or a bare ``addr@host``."""
+    match = _ADDR_IN_TEXT.search(entry)
+    return (match.group(0) if match else entry).strip().strip("<>").lower()
+
+
+def _new_addresses(*values: str, known: Optional[frozenset] = None) -> list:
+    """The addresses that were unfamiliar AT RENDER TIME.
+
+    Computed once, in present_draft, and written into the record so the seal
+    covers it. The consent card reports this list rather than re-deriving the
+    flag from the address book, because that book is an ordinary file outside
+    the seal: anything that added the recipient to it between render and
+    consent used to remove the warning from the card the human actually
+    approves against, with the Record prefix unchanged on both surfaces.
+
+    The warning is a decision made when the human was warned, not a fact
+    re-measured later.
+
+    ``known`` lets the caller pass the one snapshot of the book it already
+    read, so the sealed decision and the rendered text cannot come from two
+    different reads.
+    """
+    book = _verified_addresses() if known is None else known
+    out = []
+    for value in values:
+        if not value:
+            continue
+        for entry in _split_addresses(value):
+            bare = _bare_address(entry)
+            if bare not in book and bare not in out:
+                out.append(bare)
+    return out
+
+
+def annotate_addresses(value: str, known: Optional[frozenset] = None) -> str:
+    """Return the header value with ``[NEW ADDRESS]`` after each unknown entry.
+
+    Per-entry, not per-header: a Cc of five where one is unfamiliar must point
+    at the one, not colour the whole line. The annotation is PRESENTATION only
+    — it is applied at render time and never written into the record, so it
+    cannot perturb the digest or reach the send transport.
+    """
+    if not value:
+        return value
+    book = _verified_addresses() if known is None else known
+    out = []
+    for entry in _split_addresses(value):
+        if _bare_address(entry) in book:
+            out.append(entry)
+        else:
+            out.append(f"{entry} [NEW ADDRESS]")
+    return ", ".join(out)
+
+
 def _session_source() -> str:
     """The current session's SOURCE, read the way production binds it.
 
@@ -455,24 +692,40 @@ def _render(
     cc: Optional[str],
     resolved: List[Dict[str, Any]],
     from_addr: str = "",
+    seal: str = "",
+    known: Optional[frozenset] = None,
 ) -> str:
     """Render the reviewable draft, attachment lines included.
 
     The model does not write these lines and cannot omit one: they are
     generated from the same list that will be sent.
+
+    ``known`` is the address book as it was read ONCE by the caller, for the
+    decision that goes into the seal. The render must annotate from that same
+    snapshot: reading the book again here let a writer teach it the address
+    between the two reads, erasing the warning from the text the human reads
+    while the sealed record still called it new. On messaging and CLI the
+    render IS the consent surface, so that divergence had nothing downstream
+    to catch it.
     """
     lines = []
     if from_addr:
         lines.append(f"**From:** {from_addr}")
-    lines.append(f"**To:** {to}")
+    lines.append(f"**To:** {annotate_addresses(to, known=known)}")
     if cc:
-        lines.append(f"**Cc:** {cc}")
+        lines.append(f"**Cc:** {annotate_addresses(cc, known=known)}")
     lines.append(f"**Subject:** {subject}")
     for i, att in enumerate(resolved, 1):
         lines.append(
             f"**Attachment {i}/{len(resolved)}:** `{att['path']}` "
             f"· {att['bytes']:,} bytes"
         )
+    # The seal prefix is the reviewer's handle on THIS exact envelope. It is
+    # the same 8 characters the approval card will show, so the two can be
+    # compared by eye; if they differ, the record moved between render and
+    # send and the send will refuse.
+    if seal:
+        lines.append(f"**Record:** {seal[:8]}")
     lines += ["", "---", body.strip(), "---"]
     # The MEDIA: lines are what make the files openable in chat. They are the
     # payload of this whole tool; everything above is context for them.
@@ -530,6 +783,28 @@ def present_draft(
             ensure_ascii=False,
         )
 
+    # A header value with a line break in it is header injection: a transport
+    # that folds on CR/LF sees a header the human never read (a smuggled Bcc
+    # is the classic). The splitter does surface the smuggled line as its own
+    # flagged entry, but "visibly flagged" is the wrong answer for a character
+    # with no legitimate use in a header. Refuse; the body is exempt, prose
+    # has newlines.
+    for field, value in (
+        ("to", to), ("cc", cc), ("subject", subject), ("from", from_addr)
+    ):
+        if value and ("\r" in value or "\n" in value):
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        f"line break in the {field} header; no draft was "
+                        "rendered. A newline there can smuggle a header the "
+                        "reviewer never sees."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+
     resolved, errors = _resolve_attachments(attachments)
     if errors:
         return json.dumps(
@@ -566,6 +841,11 @@ def present_draft(
             )
 
     draft_id = f"draft_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+    # The address book, read ONCE for this draft. Both the sealed decision
+    # below and the render returned to the caller annotate from this single
+    # snapshot; two reads let a racing writer show the human a header with no
+    # warning while the seal recorded one.
+    book = _verified_addresses()
     record = {
         "draft_id": draft_id,
         "created_at": time.time(),
@@ -581,12 +861,42 @@ def present_draft(
         "subject": subject,
         "body": body,
         "attachments": resolved,
+        # The flag decision, taken once, here, while the human is being shown
+        # the render. Sealed with everything else so the card cannot be made
+        # to disagree with what they were warned about.
+        "new_addresses": _new_addresses(to, cc, known=book),
     }
+    # Write once, then seal.
+    #
+    # The seal binds the bytes we INTENDED to write — the same in-memory values
+    # the render below is built from — not whatever happens to be on disk a
+    # moment later. Sealing the read-back was wrong in the most dangerous
+    # direction: a process that overwrote the file between the write and the
+    # read got ITS bytes sealed, while the render still described the original
+    # envelope. All three send-time checks then agreed, the displayed prefix
+    # matched, and a draft the human approved to one address went to another.
+    #
+    # The read-back is still performed, but only as a check: if what came back
+    # is not what went out, someone else is writing to this path and the draft
+    # is refused rather than sealed.
     try:
         _DRAFT_DIR.mkdir(parents=True, exist_ok=True)
-        _draft_path(draft_id).write_text(
-            json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        raw = json.dumps(record, ensure_ascii=False, indent=2).encode("utf-8")
+        seal = seal_bytes(raw)
+        _draft_path(draft_id).write_bytes(raw)
+        if _draft_path(draft_id).read_bytes() != raw:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        "the draft file changed as it was being written — "
+                        "another process is writing to the draft directory; "
+                        "nothing was sealed and no draft was presented"
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        _seal_path(draft_id).write_text(seal, encoding="utf-8")
     except OSError as exc:
         return json.dumps(
             {"success": False, "error": f"could not persist draft: {exc}"},
@@ -598,7 +908,9 @@ def present_draft(
             "success": True,
             "draft_id": draft_id,
             "attachment_count": len(resolved),
-            "rendered": _render(to, subject, body, cc, resolved, from_addr),
+            "rendered": _render(
+                to, subject, body, cc, resolved, from_addr, seal, known=book
+            ),
             "note": (
                 "Post 'rendered' VERBATIM as your reply — the MEDIA: lines are "
                 "what make the files openable. Do not add, remove or reword an "
@@ -708,7 +1020,10 @@ def cleanup_cypress_attachments(draft_id: str) -> dict:
 
     removed: list[str] = []
     failed: list[dict] = []
-    for a in draft.get("attachments", []):
+    raw = draft.get("attachments")
+    for a in raw if isinstance(raw, list) else []:
+        if not isinstance(a, dict):
+            continue  # malformed entry: nothing staged to clean up
         cypress_path = a.get("cypress_path")
         if not cypress_path:
             continue  # old-format record, nothing was staged
@@ -751,22 +1066,58 @@ def _draft_card_description(draft: Dict[str, Any]) -> str:
     """
     import hashlib
 
-    lines = [
-        f"draft_id: {draft.get('draft_id', '')}",
-    ]
+    # The record prefix rides on the FIRST line, with the draft id.
+    #
+    # Not a line of its own: the desktop's floating approval card renders the
+    # description as a single truncated line (approval.tsx:96) and only reveals
+    # the rest on expand. A verification value the reviewer has to click to see
+    # is a verification value that does not get checked.
+    head = f"draft_id: {draft.get('draft_id', '')}"
+    seal = _stored_seal(str(draft.get("draft_id", "") or ""))
+    if seal:
+        head += f" — Record: {seal[:8]}"
+    lines = [head]
     # The sending identity leads the card: it is the field a misdirected send
     # gets wrong in the way that cannot be retracted.
     if draft.get("from"):
         lines.append(f"From: {draft.get('from')}")
-    lines.append(f"To: {draft.get('to', '')}")
+    # Flag from the SEALED decision, not from the address book. The book is an
+    # ordinary file outside the seal; re-deriving the flag here let anything
+    # that learned the address between render and consent erase the warning
+    # from the card, with the Record prefix identical on both surfaces.
+    flagged = draft.get("new_addresses")
+    flagged = frozenset(
+        str(a).strip().lower() for a in flagged if isinstance(a, str)
+    ) if isinstance(flagged, list) else None
+
+    def _flag(value: str) -> str:
+        if flagged is None:
+            # Pre-seal drafts and malformed records: warn on everything rather
+            # than silently showing an unflagged card.
+            return annotate_addresses(value, known=frozenset())
+        return ", ".join(
+            entry if _bare_address(entry) not in flagged
+            else f"{entry} [NEW ADDRESS]"
+            for entry in _split_addresses(value)
+        ) if value else value
+
+    lines.append(f"To: {_flag(str(draft.get('to', '') or ''))}")
     if draft.get("cc"):
-        lines.append(f"Cc: {draft.get('cc')}")
+        lines.append(f"Cc: {_flag(str(draft.get('cc')))}")
     lines.append(f"Subject: {draft.get('subject', '')}")
 
     attachments = draft.get("attachments") or []
+    if not isinstance(attachments, list):
+        # The card is built from a record that has NOT yet been seal-checked
+        # (the gate runs in send_draft). A malformed record must still produce
+        # a describable card rather than an exception on the consent path.
+        attachments = []
     if not attachments:
         lines.append("Attachments: none")
     for i, att in enumerate(attachments, 1):
+        if not isinstance(att, dict):
+            lines.append(f"Attachment {i}/{len(attachments)}: MALFORMED ENTRY")
+            continue
         path = Path(str(att.get("path", "")))
         name = path.name or "?"
         try:
@@ -860,8 +1211,16 @@ def send_draft(
     The token is spent whatever the send's outcome — one approval is one
     send attempt, never a standing permission.
     """
-    draft = load_draft(draft_id)
-    if draft is None:
+    # ── The record, read ONCE ─────────────────────────────────────────────
+    #
+    # One read, one set of bytes: the seal is checked against these bytes and
+    # the draft is parsed from these same bytes. Reading the file again for
+    # the check would be two independent reads of a mutable file, and a writer
+    # that served a forgery to the first and restored the pristine bytes
+    # before the second would get a passing seal -- identical prefix -- while
+    # the card, the attachment checks and the response all ran on its
+    # envelope. The bytes that are verified must BE the bytes that are used.
+    if not draft_id or not re.fullmatch(r"draft_[\w]+", draft_id):
         return json.dumps(
             {
                 "success": False,
@@ -870,6 +1229,131 @@ def send_draft(
                     "first; drafts are not sendable until rendered."
                 ),
             }
+        )
+    try:
+        record_bytes = _draft_path(draft_id).read_bytes()
+    except OSError:
+        record_bytes = None
+    if record_bytes is None:
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    f"no draft {draft_id!r}. Present it with present_draft "
+                    "first; drafts are not sendable until rendered."
+                ),
+            }
+        )
+    # Parsed from the bytes that the seal check below covers — not from a
+    # second read. Until that check passes this is untrusted shape: the
+    # diagnostic branch treats it accordingly.
+    try:
+        draft = json.loads(record_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        draft = None
+    if not isinstance(draft, dict):
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    f"not sent — the record for {draft_id!r} is not readable "
+                    "as a draft. Re-present it with present_draft."
+                ),
+                "draft_id": draft_id,
+            },
+            ensure_ascii=False,
+        )
+
+    # ── Record-hash re-verification ───────────────────────────────────────
+    # Before consent is sought, before a card is raised, before a token is
+    # looked up: does the record on disk still describe the envelope the
+    # reviewer read? The draft file is writable by every process sharing
+    # HERMES_HOME, so "I presented it" and "this is what I presented" are
+    # different claims, and only the digest checks the second one.
+    #
+    # Placed FIRST deliberately. Raising a card for a tampered record would
+    # ask the human to approve the modified envelope — the card is built from
+    # the same file — so the check has to come before anything asks.
+    # (a) THE RECORD FILE, before consent.
+    #
+    # Compare the seal taken when the file was written against the seal of the
+    # file right now. Both are hashes of literal bytes; neither is rebuilt from
+    # fields, so there is no recomputed value that can shadow a stored one.
+    # That shadowing is what produced three separate holes in the design this
+    # replaces.
+    #
+    # Placed FIRST deliberately. Raising a card for a tampered record would ask
+    # the human to approve the modified envelope — the card is built from the
+    # same file — so the check has to come before anything asks.
+    stored_seal = _stored_seal(draft_id)
+    if stored_seal is None:
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    "not sent — this draft has no readable seal, so what is on "
+                    "disk cannot be matched against what was reviewed. "
+                    "Re-present it with present_draft and have it approved again."
+                ),
+                "draft_id": draft_id,
+            },
+            ensure_ascii=False,
+        )
+    live_seal = seal_bytes(record_bytes)
+    if live_seal != stored_seal:
+        # A vanished attachment is reported by check (b) in words that name the
+        # file. Diagnose it here so the seal gate does not swallow the more
+        # specific message just by running earlier.
+        #
+        # This runs on a record that already FAILED the seal, so its shape is
+        # whatever an attacker wrote: attachments may be a string, a dict, or
+        # a list of non-dicts. Skip anything that is not a well-formed entry
+        # rather than indexing into it — a crash here would turn a clean
+        # refusal into an unhandled AttributeError, and a caller that catches
+        # exceptions less carefully than it checks return values could read
+        # that as something other than "refused".
+        raw_attachments = draft.get("attachments")
+        if not isinstance(raw_attachments, list):
+            raw_attachments = []
+        missing = [
+            str(att.get("path", ""))
+            for att in raw_attachments
+            if isinstance(att, dict)
+            and not Path(str(att.get("path", "") or "")).exists()
+        ]
+        if missing:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        f"not sent — {len(missing)} local file(s) no longer exist: "
+                        + ", ".join(missing[:5])
+                    ),
+                    "draft_id": draft_id,
+                    "note": (
+                        "The reviewer approved openable files. Re-publish them "
+                        "and re-present the draft."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    "not sent — the draft's record file changed after it was "
+                    "presented. The recipients, subject, body or an attachment "
+                    "entry was edited after the reviewer read it."
+                ),
+                "draft_id": draft_id,
+                "presented_record": stored_seal[:8],
+                "current_record": (live_seal or "unreadable")[:8],
+                "note": (
+                    "Do not retry and do not re-present silently. Tell the "
+                    "user the draft changed between review and send, and stop."
+                ),
+            },
+            ensure_ascii=False,
         )
 
     # Fall back to the token the gateway minted for this turn.
@@ -1016,20 +1500,55 @@ def send_draft(
     # NEW (2026-09-14): Verify BOTH the local review path and the cypress
     # transport path. The local path might exist but cypress's copy may have
     # been deleted. We check both to ensure hermes-send will succeed.
+    # (b) and (c): the attachment BYTES, immediately before transport hand-off.
+    #
+    # Each attachment carries one stored digest, written at present time. Both
+    # checks compare freshly measured bytes against THAT stored value. Neither
+    # substitutes a recomputed value for the stored one, and neither treats an
+    # unmeasurable or unparseable digest as permission to continue:
+    #
+    #   (b) local  — hash the review copy the human opened.
+    #   (c) remote — hash the staged copy the transport actually reads.
+    #
+    # A stored digest that is missing, empty, or malformed refuses. It cannot
+    # mean "nothing to check": the only way to reach send_draft without one is
+    # for the record to have been edited, and an attachment whose content
+    # cannot be verified is not an attachment that needs no verification.
     missing_local = []
     missing_cypress = []
-    
-    for a in draft.get("attachments", []):
-        # Check local (review) path
-        if not Path(a["path"]).is_file():
-            missing_local.append(a["path"])
-        
-        # Check cypress (transport) path if it exists in the record
+    swapped_local = []
+    swapped_cypress = []
+    unverifiable = []
+
+    for a in draft.get("attachments", []) or []:
+        if not isinstance(a, dict):
+            unverifiable.append(str(a)[:80])
+            continue
+
+        local_path = str(a.get("path", "") or "")
+        stored = a.get("content_sha256")
+        if not _is_sha256(stored):
+            # Covers empty, None, whitespace, wrong length, and non-strings.
+            unverifiable.append(local_path or "<no path>")
+            continue
+        stored = stored.strip()
+
+        # (b) local review copy
+        if not Path(local_path).is_file():
+            missing_local.append(local_path)
+        else:
+            local_live = _file_digest(Path(local_path))
+            if local_live is None:
+                missing_local.append(local_path)
+            elif local_live != stored:
+                swapped_local.append(local_path)
+
+        # (c) remote staged copy — the bytes the transport actually sends
         cypress_path = a.get("cypress_path")
         if cypress_path:
             try:
                 result = subprocess.run(
-                    ["ssh", "cypress", f"test -f {shlex.quote(cypress_path)}"],
+                    ["ssh", "cypress", f"test -f {shlex.quote(str(cypress_path))}"],
                     check=False,
                     capture_output=True,
                     # Generous: a TIMEOUT here would be read as "attachment
@@ -1038,28 +1557,64 @@ def send_draft(
                     timeout=int(os.environ.get("HERMES_DRAFT_SSH_TIMEOUT", "30")),
                 )
                 if result.returncode != 0:
-                    missing_cypress.append((a["path"], cypress_path))
+                    missing_cypress.append((local_path, cypress_path))
+                else:
+                    live = _remote_sha256(
+                        str(cypress_path),
+                        int(os.environ.get("HERMES_DRAFT_SSH_TIMEOUT", "30")),
+                    )
+                    if live is None:
+                        # Readable a moment ago, unmeasurable now: fail closed.
+                        missing_cypress.append((local_path, cypress_path))
+                    elif live != stored:
+                        swapped_cypress.append((local_path, cypress_path))
             except Exception as e:
                 logger.warning(
-                    "Failed to check cypress path %s: %s",
-                    cypress_path, e
+                    "Failed to check cypress path %s: %s", cypress_path, e
                 )
-                missing_cypress.append((a["path"], cypress_path))
-    
-    if missing_local or missing_cypress:
+                missing_cypress.append((local_path, cypress_path))
+
+    if (
+        missing_local
+        or missing_cypress
+        or swapped_local
+        or swapped_cypress
+        or unverifiable
+    ):
         error_parts = []
+        if swapped_cypress:
+            swapped_list = [f"{local} -> {cyp}" for local, cyp in swapped_cypress]
+            error_parts.append(
+                f"{len(swapped_cypress)} staged attachment(s) changed CONTENT "
+                f"since the draft was presented: {'; '.join(swapped_list)}. "
+                "The file the transport would send is not the file that was "
+                "reviewed. Do not retry: present the draft again so a human "
+                "sees the current document."
+            )
+        if swapped_local:
+            error_parts.append(
+                f"{len(swapped_local)} local file(s) changed CONTENT since the "
+                f"draft was presented: {', '.join(swapped_local)}. The document "
+                "on disk is not the one that was reviewed."
+            )
+        if unverifiable:
+            error_parts.append(
+                f"{len(unverifiable)} attachment(s) carry no usable content "
+                f"digest and cannot be verified: {', '.join(unverifiable)}. "
+                "A record without a digest was edited after it was written."
+            )
         if missing_local:
             error_parts.append(
                 f"{len(missing_local)} local file(s) no longer exist: "
                 f"{', '.join(missing_local)}"
             )
         if missing_cypress:
-            cypress_list = [f"{local} -> {cypress}" for local, cypress in missing_cypress]
+            cypress_list = [f"{local} -> {cyp}" for local, cyp in missing_cypress]
             error_parts.append(
                 f"{len(missing_cypress)} cypress copy/copies no longer exist: "
                 f"{'; '.join(cypress_list)}"
             )
-        
+
         return json.dumps(
             {
                 "success": False,
