@@ -892,7 +892,10 @@ def cleanup_cypress_attachments(draft_id: str) -> dict:
 
     removed: list[str] = []
     failed: list[dict] = []
-    for a in draft.get("attachments", []):
+    raw = draft.get("attachments")
+    for a in raw if isinstance(raw, list) else []:
+        if not isinstance(a, dict):
+            continue  # malformed entry: nothing staged to clean up
         cypress_path = a.get("cypress_path")
         if not cypress_path:
             continue  # old-format record, nothing was staged
@@ -956,9 +959,17 @@ def _draft_card_description(draft: Dict[str, Any]) -> str:
     lines.append(f"Subject: {draft.get('subject', '')}")
 
     attachments = draft.get("attachments") or []
+    if not isinstance(attachments, list):
+        # The card is built from a record that has NOT yet been seal-checked
+        # (the gate runs in send_draft). A malformed record must still produce
+        # a describable card rather than an exception on the consent path.
+        attachments = []
     if not attachments:
         lines.append("Attachments: none")
     for i, att in enumerate(attachments, 1):
+        if not isinstance(att, dict):
+            lines.append(f"Attachment {i}/{len(attachments)}: MALFORMED ENTRY")
+            continue
         path = Path(str(att.get("path", "")))
         name = path.name or "?"
         try:
@@ -1104,10 +1115,22 @@ def send_draft(
         # A vanished attachment is reported by check (b) in words that name the
         # file. Diagnose it here so the seal gate does not swallow the more
         # specific message just by running earlier.
+        #
+        # This runs on a record that already FAILED the seal, so its shape is
+        # whatever an attacker wrote: attachments may be a string, a dict, or
+        # a list of non-dicts. Skip anything that is not a well-formed entry
+        # rather than indexing into it — a crash here would turn a clean
+        # refusal into an unhandled AttributeError, and a caller that catches
+        # exceptions less carefully than it checks return values could read
+        # that as something other than "refused".
+        raw_attachments = draft.get("attachments")
+        if not isinstance(raw_attachments, list):
+            raw_attachments = []
         missing = [
             str(att.get("path", ""))
-            for att in (draft.get("attachments") or [])
-            if not Path(str(att.get("path", "") or "")).exists()
+            for att in raw_attachments
+            if isinstance(att, dict)
+            and not Path(str(att.get("path", "") or "")).exists()
         ]
         if missing:
             return json.dumps(

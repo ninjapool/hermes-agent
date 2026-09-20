@@ -445,6 +445,57 @@ def test_stored_digest_replaced_with_a_valid_hash_of_another_file_refuses(
 # --- the design itself -----------------------------------------------------
 
 
+MALFORMED_SHAPES = {
+    "attachments is a string": "not-a-list",
+    "attachments is a dict": {"path": "/etc/passwd"},
+    "attachments is null": None,
+    "entry is a string": ["/etc/passwd"],
+    "entry is null": [None],
+    "entry is a list": [[]],
+    "entry missing every field": [{}],
+    "digest is an int": [{"path": "/tmp/x", "content_sha256": 12345}],
+    "digest is a list": [{"path": "/tmp/x", "content_sha256": ["a" * 64]}],
+    "digest is uppercase": [{"path": "/tmp/x", "content_sha256": "A" * 64}],
+    "digest is whitespace": [{"path": "/tmp/x", "content_sha256": "   "}],
+    "digest wrong length": [{"path": "/tmp/x", "content_sha256": "abc"}],
+    "digest non-hex": [{"path": "/tmp/x", "content_sha256": "z" * 64}],
+    "cypress_path empty": [
+        {"path": "/tmp/x", "content_sha256": "a" * 64, "cypress_path": ""}
+    ],
+}
+
+
+@pytest.mark.parametrize("label", sorted(MALFORMED_SHAPES))
+def test_malformed_attachments_refuse_without_raising(
+    tmp_path, _fresh, label
+):
+    """A refusal must survive any record shape, not just plausible ones.
+
+    Round 4 noted that a malformed entry crashed out of the old digest with
+    an uncaught exception instead of returning refusal JSON. Nothing was
+    sent, so it was never a bypass — but a caller that inspects return
+    values more carefully than it catches exceptions could read a crash as
+    something other than "refused", and the card path builds its description
+    from an unverified record. Every shape returns clean refusal JSON.
+    """
+    out = _present(attachments=[_attachment(tmp_path)])
+    draft_id = out["draft_id"]
+
+    record = pd.load_draft(draft_id)
+    record["attachments"] = MALFORMED_SHAPES[label]
+    pd._draft_path(draft_id).write_text(
+        json.dumps(record, ensure_ascii=False), encoding="utf-8"
+    )
+
+    # Must not raise, and must not send.
+    result = _send(draft_id, _fresh)
+    assert result.get("success") is not True, (label, result)
+    assert result.get("error"), (label, result)
+
+    # The card is built before any seal check, from whatever is on disk.
+    pd._draft_card_description(pd.load_draft(draft_id))
+
+
 def test_a_bytes_only_edit_moves_the_seal(tmp_path, _fresh):
     """Round 4's suggestion, closed by construction rather than by a fold.
 
