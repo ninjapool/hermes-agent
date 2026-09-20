@@ -36,6 +36,7 @@ import tools.present_draft as pd
 
 DESKTOP_SESSION = "20260920_120000_desktopbb"
 KNOWN = "hk@kotoholdings.com"
+UNKNOWN = "someone-new@example.org"
 
 
 @pytest.fixture
@@ -634,3 +635,89 @@ def test_each_tamper_class_refuses_with_a_distinct_reason(tmp_path, _fresh, remo
 
     assert all(reasons.values()), reasons
     assert len(set(reasons.values())) == 3, reasons
+
+
+# --- address-book flag ------------------------------------------------------
+#
+# These six came from the deleted test_draft_record_hash.py. The design they
+# were written against is gone, but the behaviour they pin is not: the flag is
+# presentation, computed from an address book that never learns from its own
+# sends. Deleting the old file took them with it; a reviewer caught that the
+# coverage had silently vanished.
+
+
+def test_unknown_address_is_flagged_and_known_address_is_not():
+    """One known To, one unknown Cc -> exactly one flag, on the unknown."""
+    out = _present(to=KNOWN, cc=UNKNOWN)
+    rendered = out["rendered"]
+
+    to_line = next(ln for ln in rendered.splitlines() if ln.startswith("**To:**"))
+    cc_line = next(ln for ln in rendered.splitlines() if ln.startswith("**Cc:**"))
+
+    assert "[NEW ADDRESS]" not in to_line
+    assert "[NEW ADDRESS]" in cc_line
+    assert rendered.count("[NEW ADDRESS]") == 1
+
+
+def test_address_flag_appears_on_the_card_too():
+    out = _present(to=KNOWN, cc=UNKNOWN)
+    record = json.loads(
+        (pd._DRAFT_DIR / f"{out['draft_id']}.json").read_text(encoding="utf-8")
+    )
+
+    description = pd._draft_card_description(record)
+
+    assert "[NEW ADDRESS]" in description
+    to_line = next(ln for ln in description.splitlines() if ln.startswith("To:"))
+    assert "[NEW ADDRESS]" not in to_line
+
+
+def test_flag_is_per_address_within_one_cc_list():
+    """A multi-address Cc flags only the addresses that are actually unknown."""
+    out = _present(to=KNOWN, cc=f"{KNOWN}, {UNKNOWN}")
+    cc_line = next(
+        ln for ln in out["rendered"].splitlines() if ln.startswith("**Cc:**")
+    )
+
+    assert cc_line.count("[NEW ADDRESS]") == 1
+    assert cc_line.index(UNKNOWN) < cc_line.index("[NEW ADDRESS]")
+
+
+def test_address_matching_is_case_insensitive():
+    out = _present(to=KNOWN.upper())
+    to_line = next(
+        ln for ln in out["rendered"].splitlines() if ln.startswith("**To:**")
+    )
+    assert "[NEW ADDRESS]" not in to_line
+
+
+def test_display_name_form_is_matched_on_the_address_not_the_label():
+    """``Koto <hk@kotoholdings.com>`` is the known address, not a new one."""
+    out = _present(to=f"Koto-san <{KNOWN}>")
+    to_line = next(
+        ln for ln in out["rendered"].splitlines() if ln.startswith("**To:**")
+    )
+    assert "[NEW ADDRESS]" not in to_line
+
+
+def test_the_seal_does_not_cover_the_flag_text():
+    """The flag is presentation; it must not reach the sealed record.
+
+    The old version of this test asserted the flag stayed out of the
+    recomputed digest. Under freeze-and-compare there is no digest to
+    perturb, so the equivalent statement is that the flag never enters the
+    file that gets sealed, and that a flagged draft still verifies clean.
+    """
+    out = _present(to=KNOWN, cc=UNKNOWN)
+    draft_id = out["draft_id"]
+    record = json.loads(
+        (pd._DRAFT_DIR / f"{draft_id}.json").read_text(encoding="utf-8")
+    )
+
+    assert "[NEW ADDRESS]" not in record["to"]
+    assert "[NEW ADDRESS]" not in record["cc"]
+    assert "[NEW ADDRESS]" in out["rendered"]
+
+    assert pd._stored_seal(draft_id) == pd.seal_bytes(
+        pd._draft_path(draft_id).read_bytes()
+    )
