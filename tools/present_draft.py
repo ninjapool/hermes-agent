@@ -1171,8 +1171,16 @@ def send_draft(
     The token is spent whatever the send's outcome — one approval is one
     send attempt, never a standing permission.
     """
-    draft = load_draft(draft_id)
-    if draft is None:
+    # ── The record, read ONCE ─────────────────────────────────────────────
+    #
+    # One read, one set of bytes: the seal is checked against these bytes and
+    # the draft is parsed from these same bytes. Reading the file again for
+    # the check would be two independent reads of a mutable file, and a writer
+    # that served a forgery to the first and restored the pristine bytes
+    # before the second would get a passing seal -- identical prefix -- while
+    # the card, the attachment checks and the response all ran on its
+    # envelope. The bytes that are verified must BE the bytes that are used.
+    if not draft_id or not re.fullmatch(r"draft_[\w]+", draft_id):
         return json.dumps(
             {
                 "success": False,
@@ -1181,6 +1189,39 @@ def send_draft(
                     "first; drafts are not sendable until rendered."
                 ),
             }
+        )
+    try:
+        record_bytes = _draft_path(draft_id).read_bytes()
+    except OSError:
+        record_bytes = None
+    if record_bytes is None:
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    f"no draft {draft_id!r}. Present it with present_draft "
+                    "first; drafts are not sendable until rendered."
+                ),
+            }
+        )
+    # Parsed from the bytes that the seal check below covers — not from a
+    # second read. Until that check passes this is untrusted shape: the
+    # diagnostic branch treats it accordingly.
+    try:
+        draft = json.loads(record_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        draft = None
+    if not isinstance(draft, dict):
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    f"not sent — the record for {draft_id!r} is not readable "
+                    "as a draft. Re-present it with present_draft."
+                ),
+                "draft_id": draft_id,
+            },
+            ensure_ascii=False,
         )
 
     # ── Record-hash re-verification ───────────────────────────────────────
@@ -1218,7 +1259,7 @@ def send_draft(
             },
             ensure_ascii=False,
         )
-    live_seal = _live_seal(draft_id)
+    live_seal = seal_bytes(record_bytes)
     if live_seal != stored_seal:
         # A vanished attachment is reported by check (b) in words that name the
         # file. Diagnose it here so the seal gate does not swallow the more

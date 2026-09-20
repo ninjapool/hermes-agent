@@ -781,6 +781,68 @@ def test_the_flag_decision_is_inside_the_seal(tmp_path, _fresh):
     )
 
 
+def test_the_draft_that_is_sent_is_the_one_the_seal_approved(
+    tmp_path, _fresh, monkeypatch
+):
+    """One read. The bytes checked and the bytes used must be the same bytes.
+
+    Bug #7: send_draft called load_draft() to get `draft`, and only afterwards
+    read the file AGAIN for the seal comparison. Two independent reads of a
+    mutable file. A writer that served forged bytes to the first read and
+    restored the pristine bytes before the second got a passing seal check --
+    identical prefix -- while the card, the attachment checks and the response
+    all ran on its envelope.
+    """
+    approved = KNOWN
+    out = _present(to=approved)
+    draft_id = out["draft_id"]
+    path = pd._draft_path(draft_id)
+    pristine = path.read_bytes()
+
+    forged = json.loads(pristine.decode("utf-8"))
+    forged["to"] = "attacker@evil.example"
+    forged_bytes = json.dumps(forged, ensure_ascii=False, indent=2).encode("utf-8")
+
+    real_read_bytes = pathlib.Path.read_bytes
+    real_read_text = pathlib.Path.read_text
+    state = {"served_forged": False}
+
+    def racing_read_bytes(self, *a, **kw):
+        # Serve the forgery to the FIRST read of the record, then restore the
+        # pristine bytes -- the shape bug #7 exploited. If the code reads the
+        # record twice, the second read (the seal check) sees pristine bytes
+        # and passes while the forgery is the one in hand.
+        if self == path and not state["served_forged"]:
+            state["served_forged"] = True
+            return forged_bytes
+        return real_read_bytes(self, *a, **kw)
+
+    def racing_read_text(self, *a, **kw):
+        if self == path and not state["served_forged"]:
+            state["served_forged"] = True
+            return forged_bytes.decode("utf-8")
+        return real_read_text(self, *a, **kw)
+
+    token = _fresh.mint(
+        kind=KIND_DRAFT, subject_id=draft_id, session_id=DESKTOP_SESSION
+    ).token
+
+    monkeypatch.setattr(pathlib.Path, "read_text", racing_read_text)
+    monkeypatch.setattr(pathlib.Path, "read_bytes", racing_read_bytes)
+    result = json.loads(
+        pd.send_draft(
+            draft_id=draft_id,
+            approval_token=token,
+            session_id=DESKTOP_SESSION,
+        )
+    )
+
+    assert state["served_forged"], "the harness never served the forged read"
+    assert result.get("to") != "attacker@evil.example", (
+        "send_draft operated on bytes the seal never approved: " + repr(result)
+    )
+
+
 # --- multi-address entries --------------------------------------------------
 
 
