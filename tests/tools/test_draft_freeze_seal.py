@@ -721,3 +721,61 @@ def test_the_seal_does_not_cover_the_flag_text():
     assert pd._stored_seal(draft_id) == pd.seal_bytes(
         pd._draft_path(draft_id).read_bytes()
     )
+
+
+def test_the_flag_the_human_saw_survives_to_the_consent_card(tmp_path, _fresh, monkeypatch):
+    """The [NEW ADDRESS] warning must not evaporate between render and consent.
+
+    Bug #5, same shape as bug #4: the flag was recomputed at card time from
+    verified_addresses.txt, a file outside the seal. Anything that added the
+    recipient to that book between render and consent removed the warning from
+    the card the human actually approves against -- while the Record prefix on
+    both surfaces stayed byte-identical, because the seal never covered it.
+
+    The flag is a decision made once, when the human was warned. The card
+    reports that decision; it does not re-derive it.
+    """
+    stranger = "someone-brand-new@example.org"
+    out = _present(to=stranger)
+    draft_id = out["draft_id"]
+
+    assert "[NEW ADDRESS]" in out["rendered"], out["rendered"]
+
+    # The address book learns the address AFTER the human read the render.
+    monkeypatch.setattr(
+        pd, "_verified_addresses", lambda: frozenset({KNOWN, stranger})
+    )
+
+    record = json.loads(
+        pd._draft_path(draft_id).read_text(encoding="utf-8")
+    )
+    description = pd._draft_card_description(record)
+
+    assert "[NEW ADDRESS]" in description, (
+        "the warning the human saw at render time vanished from the consent "
+        "card: " + description
+    )
+
+
+def test_the_flag_decision_is_inside_the_seal(tmp_path, _fresh):
+    """Whatever drives the card's flag must be sealed, or it can be swapped."""
+    out = _present(to="another-stranger@example.org")
+    draft_id = out["draft_id"]
+    raw = pd._draft_path(draft_id).read_bytes()
+
+    record = json.loads(raw.decode("utf-8"))
+    assert "new_addresses" in record, (
+        "the flag decision is not persisted, so the card must re-derive it "
+        "from a file outside the seal"
+    )
+    assert "another-stranger@example.org" in record["new_addresses"]
+
+    # And it is covered: perturbing it moves the seal.
+    tampered = dict(record)
+    tampered["new_addresses"] = []
+    pd._draft_path(draft_id).write_bytes(
+        json.dumps(tampered, ensure_ascii=False, indent=2).encode("utf-8")
+    )
+    assert pd._stored_seal(draft_id) != pd.seal_bytes(
+        pd._draft_path(draft_id).read_bytes()
+    )

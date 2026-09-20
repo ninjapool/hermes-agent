@@ -580,6 +580,31 @@ def _bare_address(entry: str) -> str:
     return (match.group(0) if match else entry).strip().strip("<>").lower()
 
 
+def _new_addresses(*values: str) -> list:
+    """The addresses that were unfamiliar AT RENDER TIME.
+
+    Computed once, in present_draft, and written into the record so the seal
+    covers it. The consent card reports this list rather than re-deriving the
+    flag from the address book, because that book is an ordinary file outside
+    the seal: anything that added the recipient to it between render and
+    consent used to remove the warning from the card the human actually
+    approves against, with the Record prefix unchanged on both surfaces.
+
+    The warning is a decision made when the human was warned, not a fact
+    re-measured later.
+    """
+    book = _verified_addresses()
+    out = []
+    for value in values:
+        if not value:
+            continue
+        for entry in _split_addresses(value):
+            bare = _bare_address(entry)
+            if bare not in book and bare not in out:
+                out.append(bare)
+    return out
+
+
 def annotate_addresses(value: str, known: Optional[frozenset] = None) -> str:
     """Return the header value with ``[NEW ADDRESS]`` after each unknown entry.
 
@@ -757,6 +782,10 @@ def present_draft(
         "subject": subject,
         "body": body,
         "attachments": resolved,
+        # The flag decision, taken once, here, while the human is being shown
+        # the render. Sealed with everything else so the card cannot be made
+        # to disagree with what they were warned about.
+        "new_addresses": _new_addresses(to, cc),
     }
     # Write once, then seal.
     #
@@ -973,9 +1002,29 @@ def _draft_card_description(draft: Dict[str, Any]) -> str:
     # gets wrong in the way that cannot be retracted.
     if draft.get("from"):
         lines.append(f"From: {draft.get('from')}")
-    lines.append(f"To: {annotate_addresses(str(draft.get('to', '') or ''))}")
+    # Flag from the SEALED decision, not from the address book. The book is an
+    # ordinary file outside the seal; re-deriving the flag here let anything
+    # that learned the address between render and consent erase the warning
+    # from the card, with the Record prefix identical on both surfaces.
+    flagged = draft.get("new_addresses")
+    flagged = frozenset(
+        str(a).strip().lower() for a in flagged if isinstance(a, str)
+    ) if isinstance(flagged, list) else None
+
+    def _flag(value: str) -> str:
+        if flagged is None:
+            # Pre-seal drafts and malformed records: warn on everything rather
+            # than silently showing an unflagged card.
+            return annotate_addresses(value, known=frozenset())
+        return ", ".join(
+            entry if _bare_address(entry) not in flagged
+            else f"{entry} [NEW ADDRESS]"
+            for entry in _split_addresses(value)
+        ) if value else value
+
+    lines.append(f"To: {_flag(str(draft.get('to', '') or ''))}")
     if draft.get("cc"):
-        lines.append(f"Cc: {annotate_addresses(str(draft.get('cc')))}")
+        lines.append(f"Cc: {_flag(str(draft.get('cc')))}")
     lines.append(f"Subject: {draft.get('subject', '')}")
 
     attachments = draft.get("attachments") or []
