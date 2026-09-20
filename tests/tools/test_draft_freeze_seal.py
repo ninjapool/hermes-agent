@@ -879,13 +879,51 @@ def test_the_render_and_the_seal_read_the_book_once_between_them(_fresh, monkeyp
     )
 
 
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "good@x.com\r\nBcc: evil@attacker.example",
+        "good@x.com\nBcc: evil@attacker.example",
+        "good@x.com\r",
+        "good@x.com\n",
+    ],
+)
+def test_a_carriage_return_in_a_header_is_refused_outright(_fresh, bad):
+    """CR and LF do not belong in a header value, at any position.
+
+    A newline in To/Cc/Subject/From is header injection: downstream
+    transports that fold on it see a header the human never read. The
+    splitter happens to surface the smuggled line as its own flagged
+    entry, but 'visibly flagged' is the wrong answer for a character
+    that has no legitimate use here. Refuse, do not render.
+    """
+    out = _present(to=bad, allow_refusal=True)
+    assert out["success"] is False, out
+    assert "line break" in out["error"].lower(), out["error"]
+
+
+def test_a_carriage_return_in_the_subject_is_refused_too(_fresh):
+    out = _present(subject="Invoice\r\nBcc: evil@attacker.example", allow_refusal=True)
+    assert out["success"] is False, out
+    assert "line break" in out["error"].lower(), out["error"]
+
+
+def test_an_ordinary_multiline_body_is_still_fine(_fresh):
+    """The body is not a header: newlines there are just prose."""
+    out = _present(body="Dear Koto,\n\nPlease find attached.\n\nRegards,")
+    assert out["success"] is True, out
+
+
 # --- multi-address entries --------------------------------------------------
 
 
+# A newline is deliberately NOT here: CR/LF in a header value is refused
+# outright by present_draft (header injection), so it never reaches the
+# splitter. That stronger behaviour is pinned by
+# test_a_carriage_return_in_a_header_is_refused_outright.
 MULTI_SEPARATORS = {
     "space": "{a} {b}",
     "tab": "{a}\t{b}",
-    "newline": "{a}\n{b}",
     "space padded comma": "{a} , {b}",
     "semicolon": "{a};{b}",
 }

@@ -783,6 +783,28 @@ def present_draft(
             ensure_ascii=False,
         )
 
+    # A header value with a line break in it is header injection: a transport
+    # that folds on CR/LF sees a header the human never read (a smuggled Bcc
+    # is the classic). The splitter does surface the smuggled line as its own
+    # flagged entry, but "visibly flagged" is the wrong answer for a character
+    # with no legitimate use in a header. Refuse; the body is exempt, prose
+    # has newlines.
+    for field, value in (
+        ("to", to), ("cc", cc), ("subject", subject), ("from", from_addr)
+    ):
+        if value and ("\r" in value or "\n" in value):
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        f"line break in the {field} header; no draft was "
+                        "rendered. A newline there can smuggle a header the "
+                        "reviewer never sees."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+
     resolved, errors = _resolve_attachments(attachments)
     if errors:
         return json.dumps(
