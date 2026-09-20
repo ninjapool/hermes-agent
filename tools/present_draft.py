@@ -545,6 +545,10 @@ def _live_seal(draft_id: str) -> Optional[str]:
 _ADDRESS_BOOK = get_hermes_home() / "verified_addresses.txt"
 
 _ADDR_IN_TEXT = re.compile(r"[^<>,;\s]+@[^<>,;\s]+")
+# One entry: an address, with an optional display name and angle brackets
+# around it. Used to walk a header that separates entries with whitespace
+# rather than commas -- the display name's own spaces stay inside the match.
+_ADDR_ENTRY = re.compile(r"[^<>,;\s]+@[^<>,;\s]+>?")
 
 
 def _verified_addresses() -> frozenset:
@@ -570,8 +574,43 @@ def _verified_addresses() -> frozenset:
 
 
 def _split_addresses(value: str) -> List[str]:
-    """Split a To/Cc header value into individual entries, commas and semicolons."""
-    return [part.strip() for part in re.split(r"[,;]", value or "") if part.strip()]
+    """Split a To/Cc header value into individual entries.
+
+    Commas and semicolons are the conventional separators, but they are not
+    the only ones that occur: a header written with a space, a tab, or a
+    newline between two addresses is trivially produced by a model or a
+    copy-paste. Splitting only on ``[,;]`` made ``a@x.test b@y.test`` a SINGLE
+    entry, and since ``_bare_address`` takes the first address it finds, the
+    second recipient never entered the new-address decision and was never
+    flagged on either surface — a real extra recipient, riding along inside
+    another's entry, with no tampering required.
+
+    Whitespace only separates entries BETWEEN addresses, never inside one:
+    ``Koto KK <a@x.test>`` is one entry, not three. The split is therefore
+    anchored on the boundary between an address and the text that follows it.
+    """
+    if not value:
+        return []
+    parts: List[str] = []
+    for chunk in re.split(r"[,;]", value):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        # Walk the addresses in this chunk. One address -> the chunk is a
+        # single entry and keeps its display name intact. Two or more -> the
+        # chunk packed several recipients together, so each becomes its own
+        # entry, carrying the text that immediately precedes it.
+        spans = [m.span() for m in _ADDR_ENTRY.finditer(chunk)]
+        if len(spans) <= 1:
+            parts.append(chunk)
+            continue
+        starts = [0] + [e for _, e in spans[:-1]]
+        ends = [e for _, e in spans[:-1]] + [len(chunk)]
+        for start, end in zip(starts, ends):
+            piece = chunk[start:end].strip()
+            if piece:
+                parts.append(piece)
+    return parts
 
 
 def _bare_address(entry: str) -> str:

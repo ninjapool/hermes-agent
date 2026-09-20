@@ -779,3 +779,68 @@ def test_the_flag_decision_is_inside_the_seal(tmp_path, _fresh):
     assert pd._stored_seal(draft_id) != pd.seal_bytes(
         pd._draft_path(draft_id).read_bytes()
     )
+
+
+# --- multi-address entries --------------------------------------------------
+
+
+MULTI_SEPARATORS = {
+    "space": "{a} {b}",
+    "tab": "{a}\t{b}",
+    "newline": "{a}\n{b}",
+    "space padded comma": "{a} , {b}",
+    "semicolon": "{a};{b}",
+}
+
+
+@pytest.mark.parametrize("label", sorted(MULTI_SEPARATORS))
+def test_every_address_in_a_header_is_flagged_whatever_separates_them(
+    label, tmp_path, _fresh
+):
+    """A second recipient must never ride along inside another's entry.
+
+    Bug #6: _split_addresses split only on [,;], so 'good@x.com evil@e.test'
+    parsed as ONE entry and _bare_address took only the first address. The
+    second was absent from new_addresses and unflagged on BOTH surfaces --
+    no filesystem tampering needed, just a space instead of a comma.
+    """
+    stranger = "rider@attacker.example"
+    value = MULTI_SEPARATORS[label].format(a=KNOWN, b=stranger)
+
+    out = _present(to=value)
+    draft_id = out["draft_id"]
+    record = json.loads(pd._draft_path(draft_id).read_text(encoding="utf-8"))
+    card = pd._draft_card_description(record)
+
+    assert stranger in record.get("new_addresses", []), (
+        f"[{label}] the second address never entered the sealed decision: "
+        f"{record.get('new_addresses')!r}"
+    )
+    assert "[NEW ADDRESS]" in out["rendered"], f"[{label}] render: {out['rendered']}"
+    assert "[NEW ADDRESS]" in card, f"[{label}] card: {card}"
+
+
+def test_a_display_name_is_not_split_into_two_entries(tmp_path, _fresh):
+    """The fix must not treat the spaces inside 'Name <addr>' as separators."""
+    out = _present(to=f"Koto Holdings KK <{KNOWN}>")
+
+    assert "[NEW ADDRESS]" not in out["rendered"], out["rendered"]
+
+    record = json.loads(
+        pd._draft_path(out["draft_id"]).read_text(encoding="utf-8")
+    )
+    assert record["new_addresses"] == [], record["new_addresses"]
+    assert "[NEW ADDRESS]" not in pd._draft_card_description(record)
+
+
+def test_split_addresses_separates_on_whitespace_between_addresses():
+    """Unit-level: the splitter itself must see two entries, not one."""
+    assert pd._split_addresses("a@x.test b@y.test") == ["a@x.test", "b@y.test"]
+    assert pd._split_addresses("a@x.test\tb@y.test") == ["a@x.test", "b@y.test"]
+    assert pd._split_addresses("a@x.test\nb@y.test") == ["a@x.test", "b@y.test"]
+    # ...while a display name keeps its spaces:
+    assert pd._split_addresses("Koto KK <a@x.test>") == ["Koto KK <a@x.test>"]
+    assert pd._split_addresses("Koto KK <a@x.test>, B <b@y.test>") == [
+        "Koto KK <a@x.test>",
+        "B <b@y.test>",
+    ]
