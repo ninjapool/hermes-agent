@@ -843,6 +843,42 @@ def test_the_draft_that_is_sent_is_the_one_the_seal_approved(
     )
 
 
+def test_the_render_and_the_seal_read_the_book_once_between_them(_fresh, monkeypatch):
+    """One read of the address book per present_draft, not two.
+
+    Bug #8: _new_addresses() read verified_addresses.txt to seal the
+    decision, and _render() called annotate_addresses() which read it
+    AGAIN to build the text the human is shown. On every surface whose
+    consent IS the render -- messaging, CLI, /approve -- a writer that
+    taught the book the address between those two reads erased the
+    warning from the only thing the human ever sees, while the sealed
+    record still, correctly, called it new. Same prefix on both.
+    """
+    stranger = "stranger@example.org"
+    reads = {"n": 0}
+
+    def racing_book():
+        # First read (the seal) does not know the address; by the second
+        # (the render) the attacker has taught the book.
+        reads["n"] += 1
+        return frozenset() if reads["n"] == 1 else frozenset({stranger})
+
+    monkeypatch.setattr(pd, "_verified_addresses", racing_book)
+    out = _present(to=stranger)
+
+    record = json.loads(pd._draft_path(out["draft_id"]).read_bytes())
+    assert stranger in record["new_addresses"], record
+
+    assert reads["n"] <= 1, (
+        f"the address book was read {reads['n']} times in one present_draft; "
+        "the render and the seal can disagree under a racing writer"
+    )
+    assert "[NEW ADDRESS]" in out["rendered"], (
+        "the seal flagged the address as new but the render the human "
+        "reads omitted the warning: " + out["rendered"]
+    )
+
+
 # --- multi-address entries --------------------------------------------------
 
 

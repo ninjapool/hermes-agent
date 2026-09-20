@@ -619,7 +619,7 @@ def _bare_address(entry: str) -> str:
     return (match.group(0) if match else entry).strip().strip("<>").lower()
 
 
-def _new_addresses(*values: str) -> list:
+def _new_addresses(*values: str, known: Optional[frozenset] = None) -> list:
     """The addresses that were unfamiliar AT RENDER TIME.
 
     Computed once, in present_draft, and written into the record so the seal
@@ -631,8 +631,12 @@ def _new_addresses(*values: str) -> list:
 
     The warning is a decision made when the human was warned, not a fact
     re-measured later.
+
+    ``known`` lets the caller pass the one snapshot of the book it already
+    read, so the sealed decision and the rendered text cannot come from two
+    different reads.
     """
-    book = _verified_addresses()
+    book = _verified_addresses() if known is None else known
     out = []
     for value in values:
         if not value:
@@ -689,18 +693,27 @@ def _render(
     resolved: List[Dict[str, Any]],
     from_addr: str = "",
     seal: str = "",
+    known: Optional[frozenset] = None,
 ) -> str:
     """Render the reviewable draft, attachment lines included.
 
     The model does not write these lines and cannot omit one: they are
     generated from the same list that will be sent.
+
+    ``known`` is the address book as it was read ONCE by the caller, for the
+    decision that goes into the seal. The render must annotate from that same
+    snapshot: reading the book again here let a writer teach it the address
+    between the two reads, erasing the warning from the text the human reads
+    while the sealed record still called it new. On messaging and CLI the
+    render IS the consent surface, so that divergence had nothing downstream
+    to catch it.
     """
     lines = []
     if from_addr:
         lines.append(f"**From:** {from_addr}")
-    lines.append(f"**To:** {annotate_addresses(to)}")
+    lines.append(f"**To:** {annotate_addresses(to, known=known)}")
     if cc:
-        lines.append(f"**Cc:** {annotate_addresses(cc)}")
+        lines.append(f"**Cc:** {annotate_addresses(cc, known=known)}")
     lines.append(f"**Subject:** {subject}")
     for i, att in enumerate(resolved, 1):
         lines.append(
@@ -806,6 +819,11 @@ def present_draft(
             )
 
     draft_id = f"draft_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+    # The address book, read ONCE for this draft. Both the sealed decision
+    # below and the render returned to the caller annotate from this single
+    # snapshot; two reads let a racing writer show the human a header with no
+    # warning while the seal recorded one.
+    book = _verified_addresses()
     record = {
         "draft_id": draft_id,
         "created_at": time.time(),
@@ -824,7 +842,7 @@ def present_draft(
         # The flag decision, taken once, here, while the human is being shown
         # the render. Sealed with everything else so the card cannot be made
         # to disagree with what they were warned about.
-        "new_addresses": _new_addresses(to, cc),
+        "new_addresses": _new_addresses(to, cc, known=book),
     }
     # Write once, then seal.
     #
@@ -869,7 +887,7 @@ def present_draft(
             "draft_id": draft_id,
             "attachment_count": len(resolved),
             "rendered": _render(
-                to, subject, body, cc, resolved, from_addr, seal
+                to, subject, body, cc, resolved, from_addr, seal, known=book
             ),
             "note": (
                 "Post 'rendered' VERBATIM as your reply — the MEDIA: lines are "
