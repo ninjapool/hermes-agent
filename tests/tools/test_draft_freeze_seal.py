@@ -89,7 +89,7 @@ def _fresh(monkeypatch, tmp_path, remote_fs):
 
 
 def _present(*, to=KNOWN, cc="", subject="contract test", body="Body text.",
-             attachments=None, session_id=DESKTOP_SESSION):
+             attachments=None, session_id=DESKTOP_SESSION, allow_refusal=False):
     out = json.loads(
         pd.present_draft(
             to=to,
@@ -100,7 +100,8 @@ def _present(*, to=KNOWN, cc="", subject="contract test", body="Body text.",
             session_id=session_id,
         )
     )
-    assert out["success"] is True, out
+    if not allow_refusal:
+        assert out["success"] is True, out
     return out
 
 
@@ -463,6 +464,93 @@ MALFORMED_SHAPES = {
         {"path": "/tmp/x", "content_sha256": "a" * 64, "cypress_path": ""}
     ],
 }
+
+
+def test_a_racing_writer_cannot_get_its_own_bytes_sealed(tmp_path, _fresh, monkeypatch):
+    """The seal must bind the bytes we MEANT to write, not whatever landed.
+
+    present_draft wrote the file, then re-read it to seal it. A process that
+    overwrote the same path in that window got ITS bytes sealed, while the
+    returned render — built from in-memory values, never re-read — still
+    described the original envelope. The human read one draft; all three
+    checks then certified another, consistently, with a matching displayed
+    prefix. Approved to a known address, sent to the attacker's.
+    """
+    real_write_bytes = pathlib.Path.write_bytes
+    swapped = {}
+    observed = {}
+
+    def racing_write(self, data):
+        # Land the intended bytes, then let the "other process" win the race
+        # before present_draft can read the file back.
+        result = real_write_bytes(self, data)
+        if self.suffix == ".json" and not swapped:
+            record = json.loads(data.decode("utf-8"))
+            record["to"] = "attacker@evil.example"
+            swapped["record"] = record
+            real_write_bytes(
+                self, json.dumps(record, ensure_ascii=False, indent=2).encode("utf-8")
+            )
+        return result
+
+    monkeypatch.setattr(pathlib.Path, "write_bytes", racing_write)
+    out = _present(to=KNOWN, attachments=[_attachment(tmp_path)], allow_refusal=True)
+    # Read the sealed state while the draft still exists, before any fixture
+    # teardown removes it.
+    if out.get("success"):
+        did = out["draft_id"]
+        p = pd._draft_path(did)
+        if p.is_file():
+            observed["on_disk"] = json.loads(p.read_text(encoding="utf-8"))
+            observed["stored_seal"] = pd._stored_seal(did)
+            observed["live_seal"] = pd.seal_bytes(p.read_bytes())
+    monkeypatch.undo()
+
+    assert swapped, "the race never fired; the test proves nothing"
+
+    # The invariant, stated directly: whatever got sealed must be what the
+    # human was shown. Asserting on the eventual send would hide this behind
+    # the address book, which refuses the attacker's address for an unrelated
+    # reason and would let the bug through on any address the book knows.
+    if not out.get("success"):
+        return  # refusing outright is a fine answer
+
+    assert observed, "draft reported success but no record file was found"
+    rendered = out.get("rendered", "")
+
+    assert observed["on_disk"]["to"] == KNOWN, (
+        "the racing writer's envelope is what got sealed: "
+        f"{observed['on_disk']['to']!r} while the human was shown {KNOWN!r}"
+    )
+    assert "attacker@evil.example" not in rendered
+    assert observed["stored_seal"] == observed["live_seal"]
+
+
+def test_the_seal_covers_the_bytes_we_intended_to_write(tmp_path, _fresh, monkeypatch):
+    """Directly: a read-back that disagrees with the intended bytes refuses.
+
+    Independent of timing — if the file that comes back is not the file that
+    went out, present_draft must not proceed to seal it.
+    """
+    real_write_bytes = pathlib.Path.write_bytes
+
+    def write_then_corrupt(self, data):
+        result = real_write_bytes(self, data)
+        if self.suffix == ".json":
+            real_write_bytes(self, data + b"\n")
+        return result
+
+    monkeypatch.setattr(pathlib.Path, "write_bytes", write_then_corrupt)
+    out = _present(attachments=[_attachment(tmp_path)], allow_refusal=True)
+    monkeypatch.undo()
+
+    if out.get("success"):
+        # If it was allowed through, the seal must still reject at send time.
+        result = _send(out["draft_id"], _fresh)
+        assert result.get("success") is not True, (
+            "a record whose read-back differed from the intended bytes was "
+            "sealed and sent"
+        )
 
 
 @pytest.mark.parametrize("label", sorted(MALFORMED_SHAPES))

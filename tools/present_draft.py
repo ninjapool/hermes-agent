@@ -758,16 +758,36 @@ def present_draft(
         "body": body,
         "attachments": resolved,
     }
-    # Write once, then seal the bytes that landed. The seal is taken from what
-    # is actually on disk — not from the dict we intended to write — so the
-    # thing verified at send time is the thing the reviewer's render was built
-    # from. The record file is never rewritten after this point; a second write
-    # would open a window between the two.
+    # Write once, then seal.
+    #
+    # The seal binds the bytes we INTENDED to write — the same in-memory values
+    # the render below is built from — not whatever happens to be on disk a
+    # moment later. Sealing the read-back was wrong in the most dangerous
+    # direction: a process that overwrote the file between the write and the
+    # read got ITS bytes sealed, while the render still described the original
+    # envelope. All three send-time checks then agreed, the displayed prefix
+    # matched, and a draft the human approved to one address went to another.
+    #
+    # The read-back is still performed, but only as a check: if what came back
+    # is not what went out, someone else is writing to this path and the draft
+    # is refused rather than sealed.
     try:
         _DRAFT_DIR.mkdir(parents=True, exist_ok=True)
         raw = json.dumps(record, ensure_ascii=False, indent=2).encode("utf-8")
+        seal = seal_bytes(raw)
         _draft_path(draft_id).write_bytes(raw)
-        seal = seal_bytes(_draft_path(draft_id).read_bytes())
+        if _draft_path(draft_id).read_bytes() != raw:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        "the draft file changed as it was being written — "
+                        "another process is writing to the draft directory; "
+                        "nothing was sealed and no draft was presented"
+                    ),
+                },
+                ensure_ascii=False,
+            )
         _seal_path(draft_id).write_text(seal, encoding="utf-8")
     except OSError as exc:
         return json.dumps(
