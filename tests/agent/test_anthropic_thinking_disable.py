@@ -69,6 +69,12 @@ class TestThinkingOffIsSentExplicitly:
         kwargs = _kwargs("anthropic/claude-fable-5", {"enabled": False})
         assert "thinking" not in kwargs
 
+    @pytest.mark.parametrize("model", ["claude-opus-5-5", "anthropic/claude-opus-5.5"])
+    def test_opus_5_5_keeps_the_omission(self, model: str) -> None:
+        """Opus 5.5 400s on thinking.type=disabled (live probe 2026-09-23)."""
+        kwargs = _kwargs(model, {"enabled": False})
+        assert "thinking" not in kwargs
+
     def test_legacy_manual_thinking_models_keep_the_omission(self) -> None:
         """Pre-4.6 thinking is opt-in via budget_tokens: absence IS off."""
         kwargs = _kwargs("claude-sonnet-4-5", {"enabled": False})

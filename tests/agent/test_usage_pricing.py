@@ -316,6 +316,39 @@ def test_vertex_default_model_estimates_cached_usage(monkeypatch):
     assert result.amount_usd is not None and result.amount_usd > 0
 
 
+def test_live_row_missing_cache_rates_falls_back_to_static(monkeypatch):
+    """A live /models row with prompt/completion but no cache rates must not
+    blank the turn: missing rates come from the static snapshot row."""
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_endpoint_model_metadata",
+        lambda *_a, **_k: {
+            "claude-opus-5-5": {"pricing": {"prompt": "0.000004", "completion": "0.00002"}}
+        },
+    )
+    result = estimate_usage_cost(
+        "claude-opus-5-5",
+        CanonicalUsage(input_tokens=10, output_tokens=10, cache_read_tokens=1_000_000),
+        provider="anthropic",
+        base_url="https://api.anthropic.com",
+    )
+    assert result.status == "estimated"
+    # 1M cache reads at the static $0.20/M dominate the figure.
+    assert result.amount_usd is not None and result.amount_usd >= Decimal("0.20")
+
+
+def test_dated_anthropic_snapshot_ids_price_at_family_rate(monkeypatch):
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_endpoint_model_metadata", lambda *_a, **_k: {}
+    )
+    for dated, bare in (
+        ("claude-haiku-4-5-20251001", "claude-haiku-4-5"),
+        ("claude-opus-5-5-20260915", "claude-opus-5-5"),
+    ):
+        got = get_pricing_entry(dated, provider="anthropic", base_url="https://api.anthropic.com")
+        want = get_pricing_entry(bare, provider="anthropic", base_url="https://api.anthropic.com")
+        assert got is not None and got == want
+
+
 def test_normalize_usage_minimax_logs_cache_observability(caplog):
     """MiniMax providers on the Anthropic wire emit a debug-level
     cache-observability line recording the observable fields
