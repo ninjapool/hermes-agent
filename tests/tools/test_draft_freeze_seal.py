@@ -154,6 +154,17 @@ def test_render_and_card_show_the_same_seal_prefix(tmp_path, _fresh):
     assert seal[:8] in card.splitlines()[0], card
 
 
+def test_card_first_line_leads_with_the_seal_prefix(tmp_path, _fresh):
+    # The desktop card shows ONE truncated line. "On the first line" is not
+    # enough: after the 38-char draft id the prefix fell past the ellipsis and
+    # the reviewer approved without seeing it (2026-09-24, Record 095ce0b1).
+    # The prefix must be the first thing on the line so no width hides it.
+    out = _present(attachments=[_attachment(tmp_path)])
+    seal = pd._stored_seal(out["draft_id"])
+    first = pd._draft_card_description(pd.load_draft(out["draft_id"])).splitlines()[0]
+    assert first.startswith(f"Record {seal[:8]}"), first
+
+
 # --- untampered drafts still send -----------------------------------------
 
 

@@ -141,6 +141,11 @@ _NO_XHIGH_CLAUDE_SUBSTRINGS = (
 # add the family.
 _MANDATORY_THINKING_CLAUDE_SUBSTRINGS = (
     "claude-fable",
+    # Opus 5.5: upstream rejects thinking:{"type":"disabled"} with a 400
+    # (Anthropic issue #120069, confirmed live 2026-09). Adding here makes
+    # _accepts_thinking_disable() return False so we never send the disable
+    # and instead keep the omit-everything behavior that leaves thinking on.
+    "claude-opus-5-5", "claude-opus-5.5",
 )
 
 

@@ -34,7 +34,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from hermes_constants import display_hermes_home, get_hermes_home
+from hermes_constants import display_hermes_home, get_default_hermes_root, get_hermes_home
 from agent.approval_tokens import KIND_DRAFT, get_registry, get_draft_approval_token
 from tools.registry import registry
 
@@ -542,7 +542,21 @@ def _live_seal(draft_id: str) -> Optional[str]:
 # HUMAN curates; nothing in this module ever writes to it. An address book that
 # learned from its own sends would certify the first mistake as correct.
 
-_ADDRESS_BOOK = get_hermes_home() / "verified_addresses.txt"
+def _address_book_path() -> Path:
+    """The ONE book, at the Hermes root -- never inside a profile.
+
+    The book records which recipients the human has confirmed; that is a fact
+    about the human, not about whichever profile happens to render the draft.
+    Anchoring it on ``get_hermes_home()`` put it at
+    ``<root>/profiles/<name>/verified_addresses.txt`` under a named profile, a
+    file that never exists, so every recipient from every non-default profile
+    was flagged -- a warning on everything is a warning on nothing.
+
+    Deliberately no per-profile override: a profile directory is writable by
+    the agent, and a book the agent can write certifies whatever it wrote.
+    Resolved per call (not at import) so the path follows the live HERMES_HOME.
+    """
+    return get_default_hermes_root() / "verified_addresses.txt"
 
 _ADDR_IN_TEXT = re.compile(r"[^<>,;\s]+@[^<>,;\s]+")
 # One entry: an address, with an optional display name and angle brackets
@@ -560,7 +574,7 @@ def _verified_addresses() -> frozenset:
     on exactly the machine where the file went missing.
     """
     try:
-        raw = _ADDRESS_BOOK.read_text(encoding="utf-8")
+        raw = _address_book_path().read_text(encoding="utf-8")
     except OSError:
         return frozenset()
     out = set()
@@ -1066,16 +1080,20 @@ def _draft_card_description(draft: Dict[str, Any]) -> str:
     """
     import hashlib
 
-    # The record prefix rides on the FIRST line, with the draft id.
+    # The record prefix LEADS the first line.
     #
-    # Not a line of its own: the desktop's floating approval card renders the
-    # description as a single truncated line (approval.tsx:96) and only reveals
-    # the rest on expand. A verification value the reviewer has to click to see
-    # is a verification value that does not get checked.
-    head = f"draft_id: {draft.get('draft_id', '')}"
-    seal = _stored_seal(str(draft.get("draft_id", "") or ""))
+    # The desktop's floating approval card renders the description as a single
+    # truncated line (approval.tsx:96) and only reveals the rest on expand. A
+    # verification value the reviewer has to click to see is a verification
+    # value that does not get checked. Riding AFTER the 38-char draft id was
+    # not enough: on a normal-width window the prefix fell past the ellipsis
+    # (2026-09-24, Record 095ce0b1 approved unseen). First position is the
+    # only one no width can hide.
+    draft_id_str = str(draft.get("draft_id", "") or "")
+    seal = _stored_seal(draft_id_str)
+    head = f"draft_id: {draft_id_str}"
     if seal:
-        head += f" — Record: {seal[:8]}"
+        head = f"Record {seal[:8]} · {head}"
     lines = [head]
     # The sending identity leads the card: it is the field a misdirected send
     # gets wrong in the way that cannot be retracted.

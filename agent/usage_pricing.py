@@ -243,6 +243,21 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
     ),
     (
         "anthropic",
+        "claude-opus-5-5",
+    ): PricingEntry(
+        # Opus 5.5 canary rates per user spec (2026-09): $4 in / $20 out,
+        # cache read $0.20/M, 5m cache write $5/M, 1h cache write $8/M.
+        input_cost_per_million=Decimal("4.00"),
+        output_cost_per_million=Decimal("20.00"),
+        cache_read_cost_per_million=Decimal("0.20"),
+        cache_write_cost_per_million=Decimal("5.00"),
+        cache_write_1h_cost_per_million=Decimal("8.00"),
+        source="official_docs_snapshot",
+        source_url="https://docs.claude.com/en/docs/about-claude/pricing",
+        pricing_version="anthropic-pricing-2026-09",
+    ),
+    (
+        "anthropic",
         "claude-opus-5-fast",
     ): PricingEntry(
         # Fast mode is a research-preview serving tier at exactly 2x standard.
@@ -1303,6 +1318,10 @@ def _normalize_anthropic_model_name(model: str) -> str:
     # Normalize dots to dashes in version numbers (e.g. 4.7 → 4-7, 4.6 → 4-6)
     # But preserve the rest of the name structure
     name = re.sub(r"(\d+)\.(\d+)", r"\1-\2", name)
+    # Dated snapshot ids (claude-haiku-4-5-20251001, claude-opus-5-5-20260915)
+    # bill at their family rate; the table is keyed on the undated alias.
+    # Direct lookup runs first, so any explicitly dated key still wins.
+    name = re.sub(r"-\d{8}$", "", name)
     return name
 
 
@@ -1495,6 +1514,7 @@ def get_pricing_entry(
         )
     if route.provider == "openrouter":
         return _openrouter_pricing_entry(route)
+    static = _lookup_official_docs_pricing(route)
     if route.base_url:
         entry = _pricing_entry_from_metadata(
             fetch_endpoint_model_metadata(route.base_url, api_key=api_key or ""),
@@ -1503,8 +1523,33 @@ def get_pricing_entry(
             pricing_version="openai-compatible-models-api",
         )
         if entry:
+            # A live /models row can be partial (e.g. prompt/completion but no
+            # cache rates). estimate_usage_cost() treats any missing rate that
+            # the turn used as "unknown", so fill the gaps from the static
+            # snapshot instead of letting a half-row blank the whole cost.
+            if static is not None:
+                entry = _fill_missing_rates(entry, static)
             return entry
-    return _lookup_official_docs_pricing(route)
+    return static
+
+
+def _fill_missing_rates(live: PricingEntry, static: PricingEntry) -> PricingEntry:
+    """Return *live* with every ``None`` rate taken from *static*."""
+    from dataclasses import replace
+
+    fields = (
+        "input_cost_per_million",
+        "output_cost_per_million",
+        "cache_read_cost_per_million",
+        "cache_write_cost_per_million",
+        "cache_write_1h_cost_per_million",
+    )
+    updates = {
+        f: getattr(static, f)
+        for f in fields
+        if getattr(live, f) is None and getattr(static, f) is not None
+    }
+    return replace(live, **updates) if updates else live
 
 
 def normalize_usage(
