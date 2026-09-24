@@ -1080,16 +1080,20 @@ def _draft_card_description(draft: Dict[str, Any]) -> str:
     """
     import hashlib
 
-    # The record prefix rides on the FIRST line, with the draft id.
+    # The record prefix LEADS the first line.
     #
-    # Not a line of its own: the desktop's floating approval card renders the
-    # description as a single truncated line (approval.tsx:96) and only reveals
-    # the rest on expand. A verification value the reviewer has to click to see
-    # is a verification value that does not get checked.
-    head = f"draft_id: {draft.get('draft_id', '')}"
-    seal = _stored_seal(str(draft.get("draft_id", "") or ""))
+    # The desktop's floating approval card renders the description as a single
+    # truncated line (approval.tsx:96) and only reveals the rest on expand. A
+    # verification value the reviewer has to click to see is a verification
+    # value that does not get checked. Riding AFTER the 38-char draft id was
+    # not enough: on a normal-width window the prefix fell past the ellipsis
+    # (2026-09-24, Record 095ce0b1 approved unseen). First position is the
+    # only one no width can hide.
+    draft_id_str = str(draft.get("draft_id", "") or "")
+    seal = _stored_seal(draft_id_str)
+    head = f"draft_id: {draft_id_str}"
     if seal:
-        head += f" — Record: {seal[:8]}"
+        head = f"Record {seal[:8]} · {head}"
     lines = [head]
     # The sending identity leads the card: it is the field a misdirected send
     # gets wrong in the way that cannot be retracted.
