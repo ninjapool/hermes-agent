@@ -34,7 +34,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from hermes_constants import display_hermes_home, get_hermes_home
+from hermes_constants import display_hermes_home, get_default_hermes_root, get_hermes_home
 from agent.approval_tokens import KIND_DRAFT, get_registry, get_draft_approval_token
 from tools.registry import registry
 
@@ -542,7 +542,21 @@ def _live_seal(draft_id: str) -> Optional[str]:
 # HUMAN curates; nothing in this module ever writes to it. An address book that
 # learned from its own sends would certify the first mistake as correct.
 
-_ADDRESS_BOOK = get_hermes_home() / "verified_addresses.txt"
+def _address_book_path() -> Path:
+    """The ONE book, at the Hermes root -- never inside a profile.
+
+    The book records which recipients the human has confirmed; that is a fact
+    about the human, not about whichever profile happens to render the draft.
+    Anchoring it on ``get_hermes_home()`` put it at
+    ``<root>/profiles/<name>/verified_addresses.txt`` under a named profile, a
+    file that never exists, so every recipient from every non-default profile
+    was flagged -- a warning on everything is a warning on nothing.
+
+    Deliberately no per-profile override: a profile directory is writable by
+    the agent, and a book the agent can write certifies whatever it wrote.
+    Resolved per call (not at import) so the path follows the live HERMES_HOME.
+    """
+    return get_default_hermes_root() / "verified_addresses.txt"
 
 _ADDR_IN_TEXT = re.compile(r"[^<>,;\s]+@[^<>,;\s]+")
 # One entry: an address, with an optional display name and angle brackets
@@ -560,7 +574,7 @@ def _verified_addresses() -> frozenset:
     on exactly the machine where the file went missing.
     """
     try:
-        raw = _ADDRESS_BOOK.read_text(encoding="utf-8")
+        raw = _address_book_path().read_text(encoding="utf-8")
     except OSError:
         return frozenset()
     out = set()
