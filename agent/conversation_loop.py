@@ -7528,9 +7528,12 @@ def run_conversation(
                     decision = agent._tool_guardrail_halt_decision
                     _turn_exit_reason = "guardrail_halt"
                     final_response = agent._toolguard_controlled_halt_response(decision)
-                    agent._emit_status(
-                        f"⚠️ Tool guardrail halted {decision.tool_name}: {decision.code}"
-                    )
+                    _halt_status = f"⚠️ Tool guardrail halted {decision.tool_name}: {decision.code}"
+                    if decision.evidence:
+                        # Budget caps: record what the budget was spent on, so "what was it
+                        # doing?" can be answered from the log afterwards.
+                        _halt_status += " (used on: " + ", ".join(decision.evidence) + ")"
+                    agent._emit_status(_halt_status)
                     append_message(messages, {"role": "assistant", "content": final_response})
                     # Emit the halt message to the client so it's not
                     # indistinguishable from a crash.  The stream display

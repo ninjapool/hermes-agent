@@ -199,6 +199,7 @@ from agent.tool_guardrails import (
     ToolGuardrailDecision,
     append_toolguard_guidance,
     toolguard_synthetic_result,
+    toolguard_halt_response,
 )
 from agent.tool_result_classification import (
     FILE_MUTATING_TOOL_NAMES as _FILE_MUTATING_TOOLS,
@@ -8356,13 +8357,7 @@ class AIAgent:
             self._tool_guardrail_halt_decision = decision
 
     def _toolguard_controlled_halt_response(self, decision: ToolGuardrailDecision) -> str:
-        tool = decision.tool_name or "a tool"
-        return (
-            f"I stopped retrying {tool} because it hit the tool-call guardrail "
-            f"({decision.code}) after {decision.count} repeated non-progressing "
-            "attempts. The last tool result explains the blocker; the next step is "
-            "to change strategy instead of repeating the same call."
-        )
+        return toolguard_halt_response(decision)
 
     def _append_guardrail_observation(
         self,

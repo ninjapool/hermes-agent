@@ -271,6 +271,9 @@ class ToolGuardrailDecision:
     tool_name: str = ""
     count: int = 0
     signature: ToolCallSignature | None = None
+    # Budget caps only: what the budget was spent on this turn (e.g. the image paths for
+    # loop_vision_cap), so the halt message and log can say what the agent was doing.
+    evidence: tuple[str, ...] = ()
 
     @property
     def allows_execution(self) -> bool:
@@ -290,6 +293,8 @@ class ToolGuardrailDecision:
         }
         if self.signature is not None:
             data["signature"] = self.signature.to_metadata()
+        if self.evidence:
+            data["evidence"] = list(self.evidence)
         return data
 
 
@@ -379,6 +384,7 @@ class ToolCallGuardrailController:
         self._turn_web_search_count = 0
         self._turn_subagent_count = 0
         self._turn_vision_count = 0
+        self._turn_vision_images: list[str] = []
 
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
@@ -720,10 +726,12 @@ class ToolCallGuardrailController:
                     tool_name=tool_name,
                     count=self._turn_vision_count,
                     signature=signature,
+                    evidence=tuple(self._turn_vision_images),
                 )
                 self._halt_decision = decision
                 return decision
             self._turn_vision_count += 1
+            self._turn_vision_images.append(str(args.get("image_url") or "?"))
             return None
 
         if tool_name == "delegate_task":
@@ -756,6 +764,48 @@ class ToolCallGuardrailController:
             return None
 
         return None
+
+
+# Budget caps: a ceiling on calls per turn, spent on distinct work. Hitting one is NOT a loop.
+# code -> (config key under tool_loop_guardrails.loop_caps, what one unit of budget is)
+BUDGET_CAP_CODES: dict[str, tuple[str, str]] = {
+    "loop_vision_cap": ("max_vision_calls", "vision calls"),
+    "loop_web_search_cap": ("max_web_searches", "web searches"),
+    "loop_subagent_cap": ("max_subagents", "subagent spawns"),
+}
+_EVIDENCE_SHOWN = 10
+
+
+def toolguard_halt_response(decision: ToolGuardrailDecision) -> str:
+    """User-facing text for a turn stopped by a guardrail.
+
+    Budget caps and loop detectors are different events and must not share wording: a
+    budget cap says what was spent and how to raise it; only the loop detectors say
+    "repeated non-progressing attempts".
+    """
+    tool = decision.tool_name or "a tool"
+    budget = BUDGET_CAP_CODES.get(decision.code)
+    if budget is None:
+        return (
+            f"I stopped retrying {tool} because it hit the tool-call guardrail "
+            f"({decision.code}) after {decision.count} repeated non-progressing "
+            "attempts. The last tool result explains the blocker; the next step is "
+            "to change strategy instead of repeating the same call."
+        )
+    key, unit = budget
+    text = (
+        f"I stopped because this turn used its per-turn budget of {decision.count} {unit} "
+        f"({decision.code}). This is a budget limit, not a failure or a loop."
+    )
+    if decision.evidence:
+        shown = ", ".join(decision.evidence[:_EVIDENCE_SHOWN])
+        more = len(decision.evidence) - _EVIDENCE_SHOWN
+        text += f" Used on: {shown}" + (f" (+{more} more)." if more > 0 else ".")
+    text += (
+        f" The limit is tool_loop_guardrails.loop_caps.{key} in config.yaml; "
+        "the next turn starts with a fresh budget."
+    )
+    return text
 
 
 def toolguard_synthetic_result(decision: ToolGuardrailDecision) -> str:
